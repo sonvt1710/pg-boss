@@ -8,6 +8,7 @@ export default defineConfig({
   cleanUrls: true,
   lastUpdated: true,
   head: [
+    ['meta', { name: 'theme-color', content: '#2f7cf6' }],
     ['script', {}, `(function(){
       var hash = window.location.hash;
       if(window.location.pathname === '/pg-boss/' && hash.startsWith('#/')){
@@ -29,7 +30,7 @@ export default defineConfig({
     },
     nav: [
       { text: 'Get Started', link: '/introduction' },
-      { text: 'API', link: '/api/constructor' },
+      { text: 'API', link: '/api/constructor', activeMatch: '/api/' },
       {
         text: pkg.version,
         items: [
