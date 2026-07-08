@@ -200,4 +200,21 @@ describe('insert', function () {
     const noData = await spy.waitForJobWithId(otherId, 'created')
     expect(noData.data).toEqual({})
   })
+
+  it('should throw when the same explicit id appears twice in one insert batch', async function () {
+    // ON CONFLICT DO NOTHING would otherwise silently drop the duplicate; fail fast instead so a
+    // lost job surfaces as an error.
+    ctx.boss = await helper.start({ ...ctx.bossConfig, noDefault: true })
+    await ctx.boss.createQueue(ctx.schema)
+
+    const dupe = randomUUID()
+    await expect(ctx.boss.insert(ctx.schema, [
+      { id: dupe, data: { n: 1 } },
+      { id: dupe, data: { n: 2 } }
+    ])).rejects.toThrow(`duplicate job id in insert batch: ${dupe}`)
+
+    // Jobs without explicit ids never collide.
+    const ids = await ctx.boss.insert(ctx.schema, [{}, {}], { returnId: true })
+    expect(ids).toHaveLength(2)
+  })
 })

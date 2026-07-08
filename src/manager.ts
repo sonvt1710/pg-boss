@@ -1108,6 +1108,16 @@ class Manager extends EventEmitter implements types.EventsMixin {
   ) {
     assert(Array.isArray(jobs), 'jobs argument should be an array')
 
+    const seenIds = new Set<string>()
+    for (const job of jobs) {
+      if (job.id != null) {
+        if (seenIds.has(job.id)) {
+          throw new Error(`duplicate job id in insert batch: ${job.id}`)
+        }
+        seenIds.add(job.id)
+      }
+    }
+
     const { table, policy, notify } = await this.getQueueCache(name)
 
     if (policy === plans.QUEUE_POLICIES.key_strict_fifo) {
@@ -1136,6 +1146,10 @@ class Manager extends EventEmitter implements types.EventsMixin {
       } = j as types.JobInsert & { blocked?: unknown, blocking?: unknown, pendingDependencies?: unknown }
 
       if (dataById) {
+        // Best-effort spy bookkeeping, only reached when __test__enableSpies is set (a test-intended
+        // opt-in, off by default). The id we assign here is exactly what the DB would otherwise
+        // COALESCE in, so generating it client-side is harmless — and if randomUUID ever fell short,
+        // only spy attribution would degrade, never the insert itself.
         rest.id ??= randomUUID()
         dataById.set(rest.id, j.data ?? {})
       }
@@ -1154,8 +1168,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
 
     if (rows.length) {
       if (spy) {
-        // dataById is populated for every job whenever a spy is active, and every returned row.id
-        // was one we placed there, so the lookup always hits.
+        // dataById is populated for every job when a spy is active
         for (const row of rows) {
           spy.addJob(row.id, name, dataById!.get(row.id) as object, 'created')
         }
