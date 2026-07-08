@@ -1254,7 +1254,7 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
       uninstall: []
     },
     {
-      release: '12.26.0',
+      release: '12.25.2',
       version: 37,
       previous: 36,
       // Fix job_table_format(): the naive replace() mangled schema names containing `.job` or
