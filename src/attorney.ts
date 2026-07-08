@@ -173,12 +173,17 @@ function checkUpdateArgs (args: any, { upsert = false } = {}): types.Request {
   assert(!('priority' in options) || (Number.isInteger(options.priority)), 'priority must be an integer')
 
   if ('startAfter' in options) {
-    options.startAfter = (options.startAfter instanceof Date && typeof options.startAfter.toISOString === 'function')
-      ? options.startAfter.toISOString()
-      : (+options.startAfter > 0)
-          ? '' + options.startAfter
-          : (typeof options.startAfter === 'string')
-              ? options.startAfter
+    // Unlike send(), update() must honor a numeric startAfter of 0 (or negative) — the caller is
+    // explicitly pulling a deferred job forward to now. The send-style `+startAfter > 0` guard
+    // coerced 0 to undefined, which JSON.stringify then dropped, silently making the edit a no-op.
+    // Any finite number is passed through as a seconds interval ('0' -> now()); a string is kept.
+    const startAfter = options.startAfter
+    options.startAfter = (startAfter instanceof Date && typeof startAfter.toISOString === 'function')
+      ? startAfter.toISOString()
+      : (typeof startAfter === 'number' && Number.isFinite(startAfter))
+          ? '' + startAfter
+          : (typeof startAfter === 'string')
+              ? startAfter
               : undefined
   }
 

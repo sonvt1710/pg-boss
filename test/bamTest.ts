@@ -19,6 +19,16 @@ async function insertBamCommand (schema: string, name: string, command: string) 
   await db.close()
 }
 
+async function insertBamRow (schema: string, name: string, status: string, command: string, startedAgoSeconds?: number) {
+  const db = await helper.getDb()
+  const startedOn = startedAgoSeconds != null ? `now() - interval '${startedAgoSeconds} seconds'` : 'NULL'
+  await db.executeSql(`
+    INSERT INTO ${schema}.bam (name, version, status, table_name, command, started_on)
+    VALUES ($1, 27, $2, 'job_common', $3, ${startedOn})
+  `, [name, status, command])
+  await db.close()
+}
+
 async function triggerBamPoll (schema: string) {
   // Reset bam_on to allow processing on next poll cycle
   const db = await helper.getDb()
@@ -201,6 +211,48 @@ describe('bam', function () {
       expect(entry.status).toBe('failed')
       helper.assertTruthy(entry.error)
       expect(entry.error.length).toBeGreaterThan(0)
+    }, 10000)
+  })
+
+  describe('stale in_progress reclaim', function () {
+    it('should reclaim a stale in_progress command and process it', async function () {
+      const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig })
+      boss.on('error', () => {})
+
+      // A process that claimed this command died mid-flight, leaving it 'in_progress'. Nothing ever
+      // resets it, and getNextBamCommand's NOT EXISTS(in_progress) guard would block every future
+      // command behind it. Backdated past BAM_STALE_SECONDS (4h) so it must be reclaimed.
+      await insertBamRow(ctx.schema, 'stale_cmd', 'in_progress', 'SELECT 1', 5 * 60 * 60)
+
+      const done = waitForBamEvent(boss, 'stale_cmd', 'completed')
+      await triggerBamPoll(ctx.schema)
+      await done
+
+      const entry = (await boss.getBamEntries()).find((e: any) => e.name === 'stale_cmd')
+      helper.assertTruthy(entry)
+      expect(entry.status).toBe('completed')
+    }, 10000)
+
+    it('should not reclaim a fresh in_progress command (guards against double-run)', async function () {
+      const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig })
+      boss.on('error', () => {})
+
+      // A genuinely running command (started seconds ago) must still block the queue so two
+      // instances never execute the same command concurrently.
+      await insertBamRow(ctx.schema, 'fresh_cmd', 'in_progress', 'SELECT 1', 5)
+      await insertBamRow(ctx.schema, 'pending_cmd', 'pending', 'SELECT 1')
+
+      await triggerBamPoll(ctx.schema)
+      await delay(1500)
+
+      const entries = await boss.getBamEntries()
+      const fresh = entries.find((e: any) => e.name === 'fresh_cmd')
+      const pending = entries.find((e: any) => e.name === 'pending_cmd')
+
+      helper.assertTruthy(fresh)
+      helper.assertTruthy(pending)
+      expect(fresh.status).toBe('in_progress')
+      expect(pending.status).toBe('pending')
     }, 10000)
   })
 

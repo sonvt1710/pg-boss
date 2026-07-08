@@ -222,6 +222,50 @@ describe('update', function () {
     })
   })
 
+  describe('startAfter / retention', function () {
+    it('moving startAfter re-anchors keep_until by the original retention window', async function () {
+      ctx.boss = await helper.start(ctx.bossConfig)
+
+      // retentionSeconds 60 => keep_until ≈ start_after + 60s
+      const id = await ctx.boss.send(ctx.schema, { v: 1 }, { retentionSeconds: 60 })
+      assertTruthy(id)
+
+      const before = await helper.findJobs(ctx.schema, 'id = $1', [id])
+      const origKeep = new Date(before.rows[0].keep_until).getTime()
+
+      // push start an hour into the future; keep_until must slide with it, not stay in the past
+      const startAfter = new Date(Date.now() + 3600_000).toISOString()
+      await ctx.boss.update(ctx.schema, undefined, { id, startAfter })
+
+      const after = await helper.findJobs(ctx.schema, 'id = $1', [id])
+      const newStart = new Date(after.rows[0].start_after).getTime()
+      const newKeep = new Date(after.rows[0].keep_until).getTime()
+
+      expect(newKeep).toBeGreaterThan(origKeep)
+      // the ~60s retention offset is preserved relative to the new start
+      expect(Math.round((newKeep - newStart) / 1000)).toBe(60)
+    })
+
+    it('startAfter: 0 pulls a deferred job forward to now (not a silent no-op)', async function () {
+      ctx.boss = await helper.start(ctx.bossConfig)
+
+      const startAfter = new Date(Date.now() + 3600_000).toISOString()
+      const id = await ctx.boss.send(ctx.schema, { v: 1 }, { startAfter })
+      assertTruthy(id)
+
+      // deferred: not fetchable yet
+      const [none] = await ctx.boss.fetch(ctx.schema)
+      expect(none).toBeUndefined()
+
+      // pull it forward; 0 must be honored, not coerced to undefined and dropped
+      const result = await ctx.boss.update(ctx.schema, undefined, { id, startAfter: 0 })
+      expect(result).toEqual({ jobs: [id], updated: 1 })
+
+      const [job] = await helper.fetchWithRetry(ctx.boss, ctx.schema)
+      expect(job?.id).toBe(id)
+    })
+  })
+
   describe('object API', function () {
     it('should update a job passed as a single object argument', async function () {
       ctx.boss = await helper.start(ctx.bossConfig)

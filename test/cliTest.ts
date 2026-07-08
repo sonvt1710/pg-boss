@@ -288,6 +288,22 @@ describePglite('cli', function () {
         )
         expect(result.stdout).toContain('CONCURRENTLY IF NOT EXISTS')
       })
+
+      it('dry-run reads the actual installed version instead of always assuming 0', async function () {
+        // install the latest schema first
+        await execCommand(
+          `node ${cliPath} create --connection-string ${connectionString} --schema ${schema}`,
+          { expectedOutput: 'Successfully created' }
+        )
+
+        // a dry-run must now detect the DB is already current rather than printing a bogus
+        // "from version 0 to latest" script
+        const result = await execCommand(
+          `node ${cliPath} migrate --connection-string ${connectionString} --schema ${schema} --dry-run`
+        )
+        expect(result.stdout).toContain('already at version')
+        expect(result.stdout).not.toContain('from version 0')
+      })
     })
 
     describe('inline async migration', function () {

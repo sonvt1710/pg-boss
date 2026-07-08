@@ -16,6 +16,12 @@ const SINGLE_QUOTE_REGEX = /'/g
 const FIFTEEN_MINUTES = 60 * 15
 const FORTEEN_DAYS = 60 * 60 * 24 * 14
 const SEVEN_DAYS = 60 * 60 * 24 * 7
+// A bam row stuck at 'in_progress' past this means the process that claimed it died or was
+// stopped mid-command (bam.ts #processCommands returns without marking the row on #stopped or a
+// crash), and getNextBamCommand needs to reclaim it or every future async migration wedges forever.
+// Generous on purpose: real commands are index builds (CREATE INDEX CONCURRENTLY) that can run long
+// on large tables, and reclaiming a still-running one would let two instances execute it at once.
+const BAM_STALE_SECONDS = 60 * 60 * 4
 
 export const JOB_STATES = Object.freeze({
   created: 'created',
@@ -249,15 +255,20 @@ export function createIndexJobDependencyParent (schema: string) {
   return `CREATE INDEX IF NOT EXISTS job_dep_parent_idx ON ${schema}.job_dependency (parent_name, parent_id)`
 }
 
-function jobTableFormatFunction (schema: string) {
+// Anchored so a schema name that itself contains these substrings (e.g. `job_intake`) isn't
+// mangled: `\.job\y` matches only the base table reference (`schema.job`, not `schema.job_i5` whose
+// `job` is followed by `_`, nor `.job_dependency`), and `\yjob_i(\d+)` matches only the bare
+// index-name tokens (job_i1..9), never the `job_i` inside a schema name. Mirrors formatJobTable()
+// in migrationStore.ts; the migration that fixed this (v37) carries its own frozen copy.
+export function jobTableFormatFunction (schema: string) {
   return `
     CREATE FUNCTION ${schema}.job_table_format(command text, table_name text)
     RETURNS text AS
     $$
       SELECT format(
-        replace(
-          replace(command, '.job', '.%1$I'),
-          'job_i', '%1$s_i'
+        regexp_replace(
+          regexp_replace(command, '\\.job\\y', '.%1$I', 'g'),
+          '\\yjob_i(\\d+)', '%1$s_i\\1', 'g'
         ),
         table_name
       );
@@ -1269,7 +1280,12 @@ function buildFetchParams (options: FetchJobOptions): FetchQueryParams {
   if (hasIgnoreSingletons) {
     paramIndex++
     ignoreSingletonsParam = `$${paramIndex}::text[]`
-    values.push(ignoreSingletons)
+    // job_i2/job_i3 key singleton/stately jobs on the empty key (COALESCE(singleton_key, ''))
+    // as one slot, so a keyless active job must block keyless pending jobs the same way a keyed
+    // one blocks its key. Map null -> '' here so the WHERE clause's COALESCE comparison (below)
+    // never has to compare against a literal NULL array element, which would make `<> ALL(...)`
+    // evaluate to NULL (excluding every row) instead of the intended per-key filter.
+    values.push(ignoreSingletons.map(key => key ?? ''))
   }
 
   if (hasIgnoreGroups) {
@@ -1369,7 +1385,7 @@ export function fetchNextJob (options: FetchJobOptions, noSkipLocked = false): S
     `j.state < '${JOB_STATES.active}'`,
     'NOT j.blocked',
     !ignoreStartAfter ? 'j.start_after < now()' : '',
-    hasIgnoreSingletons ? `j.singleton_key <> ALL(${params.ignoreSingletonsParam})` : '',
+    hasIgnoreSingletons ? `COALESCE(j.singleton_key, '') <> ALL(${params.ignoreSingletonsParam})` : '',
     hasIgnoreGroups ? `(j.group_id IS NULL OR j.group_id <> ALL(${params.ignoreGroupsParam}))` : '',
     hasMinPriority ? `j.priority >= ${params.minPriorityParam}` : '',
     hasMaxPriority ? `j.priority <= ${params.maxPriorityParam}` : '',
@@ -1952,7 +1968,7 @@ function failJobsBody (schema: string, table: string, where: string, output: str
     ),
     dlq_jobs as (
       INSERT INTO ${schema}.job (name, data, output, retry_limit, retry_backoff, retry_delay, keep_until, deletion_seconds,
-        source_name, source_id, source_created_on, source_retry_count)
+        expire_seconds, source_name, source_id, source_created_on, source_retry_count, singleton_key, heartbeat_seconds)
       SELECT
         r.dead_letter,
         r.data,
@@ -1962,10 +1978,13 @@ function failJobsBody (schema: string, table: string, where: string, output: str
         q.retry_delay,
         now() + q.retention_seconds * interval '1s',
         q.deletion_seconds,
+        q.expire_seconds,
         r.name,
         r.id,
         r.created_on,
-        r.retry_count
+        r.retry_count,
+        r.singleton_key,
+        r.heartbeat_seconds
       FROM results r
         JOIN ${schema}.queue q ON q.name = r.dead_letter
       WHERE state = '${JOB_STATES.failed}'
@@ -2177,9 +2196,9 @@ export function insertRetryJob (schema: string, table: string): string {
 export function insertDeadLetterJob (schema: string): string {
   return `
     INSERT INTO ${schema}.job (name, data, output, retry_limit, retry_backoff, retry_delay, keep_until, deletion_seconds,
-      source_name, source_id, source_created_on, source_retry_count)
+      expire_seconds, source_name, source_id, source_created_on, source_retry_count, singleton_key, heartbeat_seconds)
     SELECT $1, $2, $3, q.retry_limit, q.retry_backoff, q.retry_delay, now() + q.retention_seconds * interval '1s', q.deletion_seconds,
-      $4, $5, $6, $7
+      q.expire_seconds, $4, $5, $6, $7, $8, $9
     FROM ${schema}.queue q WHERE q.name = $1
   `
 }
@@ -2211,11 +2230,17 @@ export function redriveJobs (schema: string, table: string): string {
     ins AS (
       INSERT INTO ${schema}.job
         (name, data, priority, retry_limit, retry_backoff, retry_delay, retry_delay_max,
-         expire_seconds, keep_until, deletion_seconds, policy)
+         expire_seconds, keep_until, deletion_seconds, policy, singleton_key, heartbeat_seconds)
       SELECT COALESCE($2, m.source_name), m.data, m.priority, q.retry_limit, q.retry_backoff,
         q.retry_delay, q.retry_delay_max, q.expire_seconds,
-        now() + q.retention_seconds * interval '1s', q.deletion_seconds, q.policy
+        now() + q.retention_seconds * interval '1s', q.deletion_seconds, q.policy,
+        m.singleton_key, m.heartbeat_seconds
       FROM moved m JOIN ${schema}.queue q ON q.name = COALESCE($2, m.source_name)
+      -- A destination queue's short/stately policy can still collide on (name, singleton_key)
+      -- if two redriven jobs share a key (job_i1/job_i3); dropping just that row here, matching
+      -- retried_jobs' ON CONFLICT DO NOTHING elsewhere, is preferable to aborting the whole batch.
+      -- The dropped job has already been deleted from the DLQ by the moved CTE and is not restored.
+      ON CONFLICT DO NOTHING
       RETURNING 1
     )
     SELECT count(*)::int AS moved FROM ins
@@ -2242,7 +2267,8 @@ export function retryJobs (schema: string, table: string) {
     WITH results as (
       UPDATE ${schema}.job
       SET state = '${JOB_STATES.retry}',
-        retry_limit = retry_limit + 1
+        retry_limit = retry_limit + 1,
+        completed_on = NULL
       WHERE name = $1
         AND id = ANY($2::uuid[])
         AND state = '${JOB_STATES.failed}'
@@ -2302,8 +2328,14 @@ export function updateJob (schema: string, table: string, name: string, by: 'id'
       SET data = CASE WHEN o.data ? 'data' THEN o.data->'data' ELSE job.data END,
           priority = COALESCE((o.data->>'priority')::int, job.priority),
           start_after = ${resolvedStartAfter},
-          keep_until = CASE WHEN o.data ? 'retentionSeconds'
-            THEN (${resolvedStartAfter}) + ((o.data->>'retentionSeconds')::int * interval '1s')
+          keep_until = CASE
+            WHEN o.data ? 'retentionSeconds'
+              THEN (${resolvedStartAfter}) + ((o.data->>'retentionSeconds')::int * interval '1s')
+            -- When only start_after moves, slide keep_until by the same original retention window
+            -- (keep_until - start_after) so pulling a job forward/back never leaves keep_until in
+            -- the past, which the deletion sweep would treat as expired and remove the pending job.
+            WHEN o.data ? 'startAfter'
+              THEN (${resolvedStartAfter}) + (job.keep_until - job.start_after)
             ELSE job.keep_until END,
           expire_seconds = COALESCE((o.data->>'expireInSeconds')::int, job.expire_seconds),
           deletion_seconds = COALESCE((o.data->>'deleteAfterSeconds')::int, job.deletion_seconds),
@@ -2316,7 +2348,12 @@ export function updateJob (schema: string, table: string, name: string, by: 'id'
           group_id = CASE WHEN o.data ? 'groupId' THEN o.data->>'groupId' ELSE job.group_id END,
           group_tier = CASE WHEN o.data ? 'groupTier' THEN o.data->>'groupTier' ELSE job.group_tier END
       FROM o
+      -- Re-check state < active on the locked row, not just in the unlocked target CTE. Under
+      -- READ COMMITTED a concurrent fetchNextJob can activate a candidate between target selection
+      -- and this UPDATE; EvalPlanQual re-evaluates this predicate on the freshly-locked row, so the
+      -- guard here prevents mutating a job a worker has already started running.
       WHERE job.id IN (SELECT id FROM target)
+        AND job.state < '${JOB_STATES.active}'
       RETURNING job.id, job.start_after
     )${tail}
   `
@@ -2337,7 +2374,7 @@ export function getQueueStats (schema: string, table: string, queues: string[]):
       FROM (
         SELECT
             name,
-            (count(*) FILTER (WHERE start_after > now()))::int as "deferredCount",
+            (count(*) FILTER (WHERE start_after > now() AND state < '${JOB_STATES.active}'))::int as "deferredCount",
             (count(*) FILTER (WHERE state < '${JOB_STATES.active}'))::int as "queuedCount",
             (count(*) FILTER (WHERE state = '${JOB_STATES.active}'))::int as "activeCount",
             (count(*) FILTER (WHERE state = '${JOB_STATES.failed}'))::int as "failedCount",
@@ -2592,12 +2629,19 @@ export function getNextBamCommand (schema: string) {
     SET status = 'in_progress', started_on = now()
     WHERE id = (
       SELECT id FROM ${schema}.bam
-      WHERE status IN ('pending', 'failed')
-        AND NOT EXISTS (SELECT 1 FROM ${schema}.bam WHERE status = 'in_progress')
-      -- Process all 'pending' commands (oldest first) before retrying any 'failed' one, so a
-      -- permanently-failing command can't sit at the head of the queue and starve everything behind
-      -- it (head-of-line blocking). Within a status, created_on preserves enqueue order.
-      ORDER BY (status = 'failed'), created_on
+      WHERE (
+        status IN ('pending', 'failed')
+        OR (status = 'in_progress' AND started_on < now() - interval '${BAM_STALE_SECONDS} seconds')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM ${schema}.bam
+        WHERE status = 'in_progress' AND started_on >= now() - interval '${BAM_STALE_SECONDS} seconds'
+      )
+      -- Process all 'pending' commands (oldest first) before retrying any 'failed' or stale
+      -- 'in_progress' one, so a permanently-failing (or crashed-mid-flight) command can't sit at
+      -- the head of the queue and starve everything behind it (head-of-line blocking). Within a
+      -- status, created_on preserves enqueue order.
+      ORDER BY (status != 'pending'), created_on
       LIMIT 1
     )
     RETURNING id, name, version, status, queue, table_name as "table", command, error,

@@ -268,20 +268,33 @@ async function cmdMigrate (args: ReturnType<typeof parseCliArgs>): Promise<void>
 
   if (args.dryRun) {
     // The CLI has no BAM worker, so inline the async index builds as direct DDL. Connect
-    // (best effort) to enumerate partitioned tables; fall back to job_common only offline.
+    // (best effort) to read the DB's actual version and enumerate partitioned tables; fall back to
+    // job_common only offline.
     let partitionTables: string[] = []
+    let version: number | null = null
     try {
       const db = await createDb(config)
       try {
         partitionTables = await getPartitionTables(db, schema)
+        version = await getSchemaVersion(db, schema)
       } finally {
         await db.close()
       }
     } catch {
       // no reachable database: emit a job_common-only static script
     }
-    const sql = migrationStore.migrate(schema, 0, undefined, undefined, { inlineAsync: true, partitionTables })
-    console.log('-- SQL to migrate pg-boss from version 0 to latest:')
+
+    if (version !== null && version >= schemaVersion) {
+      console.log(`-- pg-boss schema "${schema}" is already at version ${version} (latest: ${schemaVersion}); nothing to migrate.`)
+      return
+    }
+
+    // Render from the DB's actual version so the printed SQL is exactly what `migrate` would run.
+    // Offline (or not yet installed) we can't know it, so fall back to the oldest supported starting
+    // version — the full chain — instead of a bogus "from 0" that fails on non-idempotent steps.
+    const fromVersion = version ?? migrationStore.getMinVersion(schema)
+    const sql = migrationStore.migrate(schema, fromVersion, undefined, undefined, { inlineAsync: true, partitionTables })
+    console.log(`-- SQL to migrate pg-boss from version ${fromVersion} to ${schemaVersion}:`)
     console.log(sql)
     return
   }

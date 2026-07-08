@@ -114,4 +114,23 @@ describe('retries', function () {
     expect(state === 'retry').toBeTruthy()
     expect(retryLimit === 1).toBeTruthy()
   })
+
+  it('manual retry clears completed_on so retention deletion is not mis-triggered', async function () {
+    // fail() stamps completed_on; retry() must null it again (like resume does). If it lingers, a
+    // queue with deleteAfterSeconds can delete the job while it sits queued or active mid-flight.
+    ctx.boss = await helper.start(ctx.bossConfig)
+    const jobId = await ctx.boss.send(ctx.schema, null, { retryLimit: 0 })
+    assertTruthy(jobId)
+    await ctx.boss.fetch(ctx.schema)
+    await ctx.boss.fail(ctx.schema, jobId)
+
+    const failed = await helper.findJobs(ctx.schema, 'id = $1', [jobId])
+    expect(failed.rows[0].completed_on).toBeTruthy()
+
+    await ctx.boss.retry(ctx.schema, jobId)
+
+    const retried = await helper.findJobs(ctx.schema, 'id = $1', [jobId])
+    expect(retried.rows[0].state).toBe('retry')
+    expect(retried.rows[0].completed_on).toBeNull()
+  })
 })

@@ -118,6 +118,26 @@ describe('knex adapter', () => {
       { select2: 2 },
     ])
   })
+
+  it('should update a job through a knex transaction (updateJob mixes literal jsonb ? with $N)', async () => {
+    // updateJob's SQL carries ~11 literal jsonb `?` key-exists operators alongside its $N
+    // placeholders. knex.raw() scans the whole string for `?` to fill bindings, so those literal
+    // occurrences must be escaped; otherwise knex miscounts and throws "Undefined binding(s) detected".
+    const boss = ctx.boss = await helper.start(ctx.bossConfig)
+    if (!db) db = knex({ client: 'pg', connection: connString })
+
+    const id = await boss.send(ctx.schema, { v: 1 })
+    helper.assertTruthy(id)
+
+    const result = await db.transaction(async (trx) =>
+      boss.update(ctx.schema, { v: 2 }, { id, db: fromKnex(trx) }))
+
+    expect(result).toEqual({ jobs: [id], updated: 1 })
+
+    const job = await boss.getJobById(ctx.schema, id)
+    helper.assertTruthy(job)
+    expect(job.data).toEqual({ v: 2 })
+  })
 })
 
 describe('kysely adapter', () => {
