@@ -2,14 +2,12 @@ import type { JobMatchStrategy, UpdateQueueOptions, ManagedIndex, ManagedFunctio
 import {
   indexKeysRaw,
   indexPredicateRaw,
-  tableColumns,
-  tableColumnDefaults,
-  tableColumnTypes,
   extractFunctionBody,
   normalizeFunctionBody,
   functionName
 } from './drifter.ts'
 import type { ExpectedColumns, ExpectedConstraints } from './drifter.ts'
+import schemaManifest from './schema-manifest.json' with { type: 'json' }
 
 export interface SqlQuery {
   text: string
@@ -2834,31 +2832,28 @@ export function getIncompleteBamCommands (schema: string) {
   return `SELECT command FROM ${schema}.bam WHERE status <> 'completed'`
 }
 
-// The columns pg-boss expects on each managed table. Fixed tables carry a static column set plus their
-// column defaults (for the default-drift check); the job table's columns (shared by job_common and
-// every per-queue partition in partitioned mode) are parsed from the job DDL and carry NO defaults —
-// their FKs are profile-dependent and keep_until's interval default is not text-comparable, so those
-// tables are name-only. queue_stats drops nothing between modes, only its partitioning, so the column
-// set is mode-independent. A table with no live columns is skipped by the diff, so listing a table that
-// does not exist yet (e.g. bam on a pre-v27 schema) is harmless.
+// The columns pg-boss expects on each managed table, taken from the manifest (introspected column type,
+// nullability, and default). Fixed tables carry the full defaults + types maps so column defaults, data
+// types, and nullability are diffed; the job table (shared by job_common and every per-queue partition
+// in partitioned mode) is name-only — its FKs are profile-dependent and keep_until's interval default is
+// not worth pinning per-partition. A table with no live columns is skipped by the diff, so listing one
+// that does not exist yet is harmless.
 export function expectedManagedColumns (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): ExpectedColumns[] {
-  // Fixed tables carry defaults + types so column defaults, data types, and nullability are diffed too;
-  // the job/partition tables get a name-only entry (their defaults/types are profile-dependent).
-  const fixed = (table: string, ddl: string): ExpectedColumns =>
-    ({ table, columns: tableColumns(ddl), defaults: tableColumnDefaults(ddl), types: tableColumnTypes(ddl) })
+  const fixed = new Set(FIXED_MANAGED_TABLES)
+  const byTable = new Map<string, ExpectedColumns>()
+  const jobColumns: string[] = []
 
-  const out: ExpectedColumns[] = [
-    fixed('version', createTableVersion(schema)),
-    fixed('queue', createTableQueue(schema)),
-    fixed('schedule', createTableSchedule(schema)),
-    fixed('subscription', createTableSubscription(schema)),
-    fixed('bam', createTableBam(schema)),
-    fixed('warning', createTableWarning(schema)),
-    fixed('queue_stats', createTableQueueStats(schema, !partitioned)),
-    fixed('job_dependency', createTableJobDependency(schema))
-  ]
+  for (const c of manifestSection(partitioned).columns) {
+    if (c.table === 'job') { jobColumns.push(c.column); continue }
+    if (!fixed.has(c.table)) continue // job_common / anything else derives from the job template below
+    let entry = byTable.get(c.table)
+    if (!entry) byTable.set(c.table, entry = { table: c.table, columns: [], defaults: {}, types: {} })
+    entry.columns.push(c.column)
+    entry.types![c.column] = { type: applyManifestSchema(c.type, schema), notNull: c.notNull }
+    if (c.default != null) entry.defaults![c.column] = applyManifestSchema(c.default, schema)
+  }
 
-  const jobColumns = tableColumns(createTableJob(schema))
+  const out = [...byTable.values()]
   out.push({ table: 'job', columns: jobColumns })
   if (partitioned) {
     out.push({ table: COMMON_JOB_TABLE, columns: jobColumns })
@@ -2868,44 +2863,46 @@ export function expectedManagedColumns (schema: string, partitioned: boolean, pa
   return out
 }
 
-// The tables pg-boss expects to exist. The fixed set is always present; the partitioned architecture
-// adds job_common and every per-queue partition table (the `job` parent table exists in both modes).
+// The generated schema manifest (scripts/gen-manifest.ts) is the single source of truth for the
+// fixed-shape expectations — tables, constraints, and the enum — introspected from a fresh schema with
+// the schema name replaced by a placeholder. These no longer duplicate the DDL as hand-written
+// literals: change the CREATE TABLE/TYPE DDL, run `npm run gen:manifest`, and they update automatically.
+const FIXED_MANAGED_TABLES = ['version', 'queue', 'schedule', 'subscription', 'bam', 'warning', 'queue_stats', 'job_dependency']
+
+function manifestSection (partitioned: boolean) {
+  return partitioned ? schemaManifest.partitioned : schemaManifest.nonPartitioned
+}
+
+function applyManifestSchema (text: string, schema: string): string {
+  return text.split(schemaManifest.schemaToken).join(schema)
+}
+
+// The tables pg-boss expects to exist. The manifest lists the fixed tables plus job (and job_common in
+// partitioned mode); per-queue partition tables are dynamic, so they are appended from the live set.
 export function expectedManagedTables (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): string[] {
-  const tables = ['version', 'queue', 'schedule', 'subscription', 'bam', 'warning', 'queue_stats', 'job_dependency', 'job']
-  if (partitioned) {
-    tables.push(COMMON_JOB_TABLE)
-    for (const p of partitions) tables.push(p.table)
-  }
+  const tables = [...manifestSection(partitioned).tables]
+  if (partitioned) for (const p of partitions) tables.push(p.table)
   return tables
 }
 
-// The constraints pg-boss expects on each FIXED managed table (job/job_common/partitions are excluded:
-// their FKs are profile-dependent DEFERRABLE). These literals were captured from live
-// pg_get_constraintdef on a fresh schema, so they compare equal after normalizeConstraintDef — the
-// fresh-install integration test verifies this.
+// The constraints pg-boss expects on each FIXED managed table, taken verbatim from the manifest's
+// pg_get_constraintdef capture (job/job_common/partitions are excluded: their FKs are profile-dependent
+// DEFERRABLE). Compared as a normalized set, so order is irrelevant. The fresh-install integration test
+// verifies the manifest matches live.
 export function expectedManagedConstraints (schema: string, partitioned: boolean): ExpectedConstraints[] {
-  return [
-    { table: 'version', constraints: ['PRIMARY KEY (version)'] },
-    { table: 'queue', constraints: ['PRIMARY KEY (name)', `FOREIGN KEY (dead_letter) REFERENCES ${schema}.queue(name)`, 'CHECK ((dead_letter IS DISTINCT FROM name))'] },
-    { table: 'schedule', constraints: ['PRIMARY KEY (name, key)', `FOREIGN KEY (name) REFERENCES ${schema}.queue(name) ON DELETE CASCADE`] },
-    { table: 'subscription', constraints: ['PRIMARY KEY (event, name)', `FOREIGN KEY (name) REFERENCES ${schema}.queue(name) ON DELETE CASCADE`] },
-    { table: 'bam', constraints: ['PRIMARY KEY (id)'] },
-    { table: 'warning', constraints: ['PRIMARY KEY (id)'] },
-    { table: 'queue_stats', constraints: [partitioned ? 'PRIMARY KEY (id, captured_on)' : 'PRIMARY KEY (id)'] },
-    { table: 'job_dependency', constraints: ['PRIMARY KEY (child_name, child_id, parent_name, parent_id)'] }
-  ]
+  const fixed = new Set(FIXED_MANAGED_TABLES)
+  const byTable = new Map<string, string[]>()
+  for (const { table, def } of manifestSection(partitioned).constraints) {
+    if (!fixed.has(table)) continue
+    const list = byTable.get(table) ?? byTable.set(table, []).get(table)!
+    list.push(applyManifestSchema(def, schema))
+  }
+  return [...byTable].map(([table, constraints]) => ({ table, constraints }))
 }
 
-// The job_state values in declaration order — must stay in sync with createEnumJobState. The base type
-// is numeric, so first values are less than last values and state comparisons depend on this order.
-export const EXPECTED_JOB_STATES: readonly string[] = [
-  JOB_STATES.created,
-  JOB_STATES.retry,
-  JOB_STATES.active,
-  JOB_STATES.completed,
-  JOB_STATES.cancelled,
-  JOB_STATES.failed
-]
+// The job_state enum values in declaration order, from the manifest (both sections carry the same enum).
+// Order is significant — the numeric base type makes created < retry < … < failed load-bearing.
+export const EXPECTED_JOB_STATES: readonly string[] = schemaManifest.partitioned.enum
 
 // The functions pg-boss expects to exist in `schema`. The partitioned architecture adds the three
 // job_table_* helpers and uses the partition-aware create_queue/delete_queue bodies; non-partitioned

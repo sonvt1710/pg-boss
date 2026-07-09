@@ -138,130 +138,11 @@ export function normalizeFunctionBody (body: string): string {
   return body.replace(/\s+/g, ' ').trim()
 }
 
-// Fragment-leading keywords that introduce a table-level constraint (or a LIKE clause) rather than a
-// column definition, so the parser skips them when extracting column names.
-const NON_COLUMN_KEYWORDS = new Set(['constraint', 'primary', 'foreign', 'unique', 'check', 'exclude', 'like', 'deferrable'])
-
-// Splits the top-level parenthesised body of a CREATE TABLE statement into its depth-0 fragments (one
-// per column definition or table-level constraint). SQL line comments are stripped first. A column's
-// own parens — default(0), gen_random_uuid(), CHECK (...) — never split it. Returns [] when there is
-// no parsed body (e.g. a `LIKE`-only table).
-function tableColumnFragments (ddl: string): string[] {
-  const noComments = ddl.replace(/--[^\n]*/g, '')
-  const open = noComments.indexOf('(')
-  if (open === -1) return []
-
-  let depth = 0
-  let end = -1
-  for (let i = open; i < noComments.length; i++) {
-    if (noComments[i] === '(') depth++
-    else if (noComments[i] === ')' && --depth === 0) { end = i; break }
-  }
-  if (end === -1) return []
-
-  const body = noComments.slice(open + 1, end)
-  const fragments: string[] = []
-  let start = 0
-  depth = 0
-  for (let i = 0; i < body.length; i++) {
-    if (body[i] === '(') depth++
-    else if (body[i] === ')') depth--
-    else if (body[i] === ',' && depth === 0) { fragments.push(body.slice(start, i)); start = i + 1 }
-  }
-  fragments.push(body.slice(start))
-  return fragments
-}
-
-// Extracts the column names from a CREATE TABLE statement, lower-cased and in declaration order. Takes
-// the first identifier of each fragment, skipping fragments that open with a table-level constraint
-// keyword. Returns [] when there is no parsed column list (e.g. a `LIKE`-only table).
-export function tableColumns (ddl: string): string[] {
-  const columns: string[] = []
-  for (const frag of tableColumnFragments(ddl)) {
-    const m = frag.trim().match(/^"?([a-z_][\w$]*)"?/i)
-    if (!m) continue
-    const first = m[1].toLowerCase()
-    if (NON_COLUMN_KEYWORDS.has(first)) continue
-    columns.push(first)
-  }
-  return columns
-}
-
-// Extracts each column's DEFAULT expression from a CREATE TABLE statement, keyed by lower-cased column
-// name (columns without a default are omitted). Uses the same top-level-comma fragment split as
-// tableColumns; for each column fragment, takes everything after the DEFAULT keyword.
-export function tableColumnDefaults (ddl: string): Record<string, string> {
-  const defaults: Record<string, string> = {}
-  for (const frag of tableColumnFragments(ddl)) {
-    const nameMatch = frag.trim().match(/^"?([a-z_][\w$]*)"?/i)
-    if (!nameMatch) continue
-    const col = nameMatch[1].toLowerCase()
-    if (NON_COLUMN_KEYWORDS.has(col)) continue
-    const defMatch = frag.match(/\bdefault\b\s*(.+)$/is)
-    if (defMatch) defaults[col] = defMatch[1].trim()
-  }
-  return defaults
-}
-
 // Normalises a default expression so a hand-written DDL default and information_schema.column_default
 // compare equal: lower-cased, casts stripped ('pending'::text -> 'pending', '{}'::integer[] -> '{}'),
 // whitespace collapsed, and any redundant outer parens removed.
 export function normalizeDefault (expr: string): string {
   return stripOuterParens(expr.toLowerCase().replace(CAST_REGEX, '').replace(/\s+/g, ' ').trim())
-}
-
-// Maps the type aliases pg-boss writes in its DDL onto the canonical form format_type() returns, so a
-// hand-written `int`/`bool`/`timestamptz`/`int[]` compares equal to the catalog's
-// `integer`/`boolean`/`timestamp with time zone`/`integer[]`.
-const TYPE_ALIASES: Record<string, string> = {
-  int: 'integer',
-  int4: 'integer',
-  bool: 'boolean',
-  timestamptz: 'timestamp with time zone',
-  varchar: 'character varying',
-  'int[]': 'integer[]',
-  'int4[]': 'integer[]'
-}
-
-export function normalizeColumnType (raw: string): string {
-  const t = raw.toLowerCase().replace(/\s+/g, ' ').trim()
-  return TYPE_ALIASES[t] ?? t
-}
-
-// Extracts each column's data type and NOT NULL expectation from a CREATE TABLE statement, keyed by
-// lower-cased column name. The type is the text between the column name and the first column-option
-// keyword (NOT NULL / DEFAULT / REFERENCES / etc.), normalised to the canonical form. A column counts
-// as NOT NULL when it carries the keyword, an inline PRIMARY KEY, or appears in a table-level PRIMARY
-// KEY (Postgres makes primary-key columns NOT NULL implicitly). Uses the same fragment split as
-// tableColumns.
-export function tableColumnTypes (ddl: string): Record<string, { type: string, notNull: boolean }> {
-  const out: Record<string, { type: string, notNull: boolean }> = {}
-  const pkColumns = new Set<string>()
-
-  for (const frag of tableColumnFragments(ddl)) {
-    const trimmed = frag.trim()
-    const nameMatch = trimmed.match(/^"?([a-z_][\w$]*)"?/i)
-    if (!nameMatch) continue
-    const first = nameMatch[1].toLowerCase()
-
-    if (NON_COLUMN_KEYWORDS.has(first)) {
-      if (/^primary\s+key/i.test(trimmed)) {
-        const cols = trimmed.match(/\(([^)]*)\)/)
-        if (cols) for (const c of cols[1].split(',')) pkColumns.add(c.trim().replace(/"/g, '').toLowerCase())
-      }
-      continue
-    }
-
-    const rest = trimmed.slice(nameMatch[0].length).trim()
-    const stop = rest.search(/\b(not\s+null|default|primary\s+key|references|check|unique|generated|collate)\b/i)
-    const rawType = (stop === -1 ? rest : rest.slice(0, stop)).trim()
-    const notNull = /\bnot\s+null\b/i.test(frag) || /\bprimary\s+key\b/i.test(frag)
-    out[first] = { type: normalizeColumnType(rawType), notNull }
-    if (/\bprimary\s+key\b/i.test(frag)) pkColumns.add(first)
-  }
-
-  for (const col of pkColumns) if (out[col]) out[col].notNull = true
-  return out
 }
 
 // Normalises a pg_get_constraintdef string for set comparison: lower-cased, quotes and casts stripped,
@@ -450,9 +331,11 @@ export function computeColumnDrift (expected: ExpectedColumns[], live: LiveColum
       }
 
       if (types && types[col]) {
-        const actualType = normalizeColumnType(liveCol.type ?? '')
+        // Both sides are the canonical format_type() form (expected from the manifest, actual from the
+        // live catalog), so a direct comparison suffices — no alias folding needed.
+        const actualType = liveCol.type ?? ''
         if (types[col].type !== actualType) {
-          typeMismatches.push({ column: col, expected: types[col].type, actual: liveCol.type ?? '' })
+          typeMismatches.push({ column: col, expected: types[col].type, actual: actualType })
         }
         if (types[col].notNull !== !!liveCol.notNull) {
           nullabilityMismatches.push({ column: col, expected: types[col].notNull, actual: !!liveCol.notNull })

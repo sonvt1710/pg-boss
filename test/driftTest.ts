@@ -344,31 +344,7 @@ describe('drift', function () {
     })
   })
 
-  describe('tableColumns / column drift (pure)', function () {
-    it('parses column names and skips table-level constraints', function () {
-      const cols = drifter.tableColumns(`CREATE TABLE s.t (
-        id uuid PRIMARY KEY default gen_random_uuid(),
-        name text NOT NULL,
-        dead_letter text REFERENCES s.q (name) CHECK (dead_letter IS DISTINCT FROM name),
-        ready_history int[] NOT NULL default '{}',
-        PRIMARY KEY (name)
-      )`)
-      expect(cols).toEqual(['id', 'name', 'dead_letter', 'ready_history'])
-    })
-
-    it('strips SQL line comments before parsing', function () {
-      const cols = drifter.tableColumns(`CREATE TABLE s.t (
-        id uuid,
-        -- created via clock_timestamp() so ordering holds
-        created_on timestamptz
-      )`)
-      expect(cols).toEqual(['id', 'created_on'])
-    })
-
-    it('returns empty for a LIKE-only table', function () {
-      expect(drifter.tableColumns('CREATE TABLE s.job_common (LIKE s.job INCLUDING DEFAULTS)')).toEqual([])
-    })
-
+  describe('column drift (pure)', function () {
     it('expectedManagedColumns lists job_common and partitions with the job column set only when partitioned', function () {
       const np = plans.expectedManagedColumns('pgboss', false).map(t => t.table)
       expect(np).toContain('job')
@@ -503,20 +479,6 @@ describe('drift', function () {
       expect(drifter.normalizeDefault('gen_random_uuid()')).toBe('gen_random_uuid()')
     })
 
-    it('tableColumnDefaults parses each column default and skips columns without one', function () {
-      const defaults = drifter.tableColumnDefaults(`CREATE TABLE s.t (
-        id uuid PRIMARY KEY default gen_random_uuid(),
-        priority integer not null default 0,
-        status text NOT NULL DEFAULT 'pending',
-        name text NOT NULL,
-        PRIMARY KEY (id)
-      )`)
-      expect(defaults.id).toBe('gen_random_uuid()')
-      expect(defaults.priority).toBe('0')
-      expect(defaults.status).toBe("'pending'")
-      expect(defaults.name).toBeUndefined()
-    })
-
     it('normalizeConstraintDef lower-cases and strips quotes and casts', function () {
       expect(drifter.normalizeConstraintDef('CHECK ((dead_letter IS DISTINCT FROM name))'))
         .toBe('check ((dead_letter is distinct from name))')
@@ -593,30 +555,6 @@ describe('drift', function () {
   })
 
   describe('column type / nullability + table presence (pure)', function () {
-    it('normalizeColumnType folds DDL aliases to the format_type canonical form', function () {
-      expect(drifter.normalizeColumnType('int')).toBe('integer')
-      expect(drifter.normalizeColumnType('BOOL')).toBe('boolean')
-      expect(drifter.normalizeColumnType('timestamptz')).toBe('timestamp with time zone')
-      expect(drifter.normalizeColumnType('int[]')).toBe('integer[]')
-      expect(drifter.normalizeColumnType('text')).toBe('text')
-    })
-
-    it('tableColumnTypes parses types and NOT NULL, including implicit primary-key NOT NULL', function () {
-      const types = drifter.tableColumnTypes(`CREATE TABLE s.t (
-        id int primary key,
-        name text NOT NULL,
-        note text,
-        parent text REFERENCES s.q,
-        tags int[] NOT NULL default '{}',
-        PRIMARY KEY (name, parent)
-      )`)
-      expect(types.id).toEqual({ type: 'integer', notNull: true })   // inline primary key
-      expect(types.name).toEqual({ type: 'text', notNull: true })    // explicit + table-level PK
-      expect(types.note).toEqual({ type: 'text', notNull: false })
-      expect(types.parent).toEqual({ type: 'text', notNull: true })  // no keyword, but in table-level PK
-      expect(types.tags).toEqual({ type: 'integer[]', notNull: true })
-    })
-
     it('flags a column type mismatch', function () {
       const report = drifter.computeSchemaDrift([], [], {
         columns: {
@@ -666,15 +604,6 @@ describe('drift', function () {
       expect(report.ok).toBe(true)
     })
 
-    it('tableColumnTypes handles constraint fragments and malformed primary keys defensively', function () {
-      // trailing-comma empty fragment, a non-PK table constraint, a parenless PRIMARY KEY, and a PK
-      // naming a column with no definition — none should throw or add a bogus column
-      expect(drifter.tableColumnTypes('CREATE TABLE s.t (a int, )')).toEqual({ a: { type: 'integer', notNull: false } })
-      expect(drifter.tableColumnTypes('CREATE TABLE s.t (a int, CHECK (a > 0))')).toEqual({ a: { type: 'integer', notNull: false } })
-      expect(drifter.tableColumnTypes('CREATE TABLE s.t (a int, PRIMARY KEY)')).toEqual({ a: { type: 'integer', notNull: false } })
-      expect(drifter.tableColumnTypes('CREATE TABLE s.t (a int, PRIMARY KEY (ghost))')).toEqual({ a: { type: 'integer', notNull: false } })
-    })
-
     it('treats a live column with no type as an empty actual type', function () {
       const report = drifter.computeSchemaDrift([], [], {
         columns: {
@@ -697,19 +626,6 @@ describe('drift', function () {
   describe('drifter edge branches (pure)', function () {
     it('extractFunctionBody returns empty when the closing tag is missing', function () {
       expect(drifter.extractFunctionBody('CREATE FUNCTION s.f() AS $$ BEGIN')).toBe('')
-    })
-
-    it('tableColumns returns empty when there is no parenthesised body', function () {
-      expect(drifter.tableColumns('CREATE TABLE s.t')).toEqual([])
-    })
-
-    it('tableColumns returns empty when the parens are unbalanced', function () {
-      expect(drifter.tableColumns('CREATE TABLE s.t (a int, b int')).toEqual([])
-    })
-
-    it('tableColumns and tableColumnDefaults skip an empty trailing-comma fragment', function () {
-      expect(drifter.tableColumns('CREATE TABLE s.t (a int, )')).toEqual(['a'])
-      expect(drifter.tableColumnDefaults('CREATE TABLE s.t (a int default 0, )')).toEqual({ a: '0' })
     })
 
     it('functionName returns empty for a non-function statement', function () {
