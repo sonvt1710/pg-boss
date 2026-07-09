@@ -19,9 +19,19 @@ const SEVEN_DAYS = 60 * 60 * 24 * 7
 // A bam row stuck at 'in_progress' past this means the process that claimed it died or was
 // stopped mid-command (bam.ts #processCommands returns without marking the row on #stopped or a
 // crash), and getNextBamCommand needs to reclaim it or every future async migration wedges forever.
-// Generous on purpose: real commands are index builds (CREATE INDEX CONCURRENTLY) that can run long
-// on large tables, and reclaiming a still-running one would let two instances execute it at once.
-const BAM_STALE_SECONDS = 60 * 60 * 4
+// This is the *fallback* backstop only — deliberately long (24h) because false-reclaim is the worse
+// failure: reclaiming a still-running CREATE INDEX CONCURRENTLY runs two builds on the same index at
+// once, and an interrupted CONCURRENTLY leaves an INVALID index needing manual cleanup. The intended
+// *primary* trigger is a liveness check against pg_stat_progress_create_index (reclaim as soon as no
+// backend is actually building), which recovers in minutes instead of a day; the 24h timeout only
+// covers cases liveness can't classify (non-index commands, or a build that never registered).
+const BAM_STALE_SECONDS = 60 * 60 * 24
+// Liveness grace window: on the native-Postgres path we don't trust a "no build running" reading
+// until a claimed command has had time to actually start and register in pg_stat_progress_create_index
+// (pool latency between claiming the row and issuing the build). Below this age, an in_progress row is
+// only reclaimed via the 24h fallback, never via liveness — so a genuinely-running build is never
+// yanked out from under itself.
+const BAM_LIVENESS_GRACE_SECONDS = 60 * 5
 
 export const JOB_STATES = Object.freeze({
   created: 'created',
@@ -2623,30 +2633,98 @@ export function getBlockedKeys (schema: string, table: string) {
     `
 }
 
-export function getNextBamCommand (schema: string) {
+export function getNextBamCommand (schema: string, { useLiveness = false }: { useLiveness?: boolean } = {}) {
+  // Head-of-line note (shared by both variants): process all 'pending' commands (oldest first)
+  // before retrying any 'failed' or stale 'in_progress' one, so a permanently-failing (or
+  // crashed-mid-flight) command can't sit at the head of the queue and starve everything behind it.
+  // Within a status, created_on preserves enqueue order.
+  if (!useLiveness) {
+    // Timeout-only path for engines without pg_stat_progress_create_index (CockroachDB/YugabyteDB):
+    // a stuck in_progress row is reclaimed purely on the 24h fallback. No CONCURRENTLY healing, so no
+    // reclaimed flag is emitted (bam.ts skips healing when noIndexProgressView is set anyway).
+    return `
+      UPDATE ${schema}.bam
+      SET status = 'in_progress', started_on = now()
+      WHERE id = (
+        SELECT id FROM ${schema}.bam
+        WHERE (
+          status IN ('pending', 'failed')
+          OR (status = 'in_progress' AND started_on < now() - interval '${BAM_STALE_SECONDS} seconds')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM ${schema}.bam
+          WHERE status = 'in_progress' AND started_on >= now() - interval '${BAM_STALE_SECONDS} seconds'
+        )
+        ORDER BY (status != 'pending'), created_on
+        LIMIT 1
+      )
+      RETURNING id, name, version, status, queue, table_name as "table", command, error,
+                created_on as "createdOn", started_on as "startedOn", completed_on as "completedOn"
+    `
+  }
+
+  // Native-Postgres liveness path. An in_progress row counts as "stale" (reclaimable) when either the
+  // 24h fallback elapsed, or it's past the grace window AND no backend is actually building its index
+  // (per pg_stat_progress_create_index). The same predicate, negated, defines a genuinely-live command
+  // that must still block the queue — so a running build is never reclaimed, and a dead one recovers in
+  // minutes instead of a day. Visibility caveat: pg_stat_progress_create_index only shows rows for the
+  // querying role's own backends (or with pg_read_all_stats); pg-boss instances sharing one DB role —
+  // the norm — see each other's builds. If they don't, liveness reads "dead" and the 24h fallback still
+  // caps the exposure.
+  //
+  // liveBuild(tableCol): is there a live CREATE INDEX on the row's table in this database? relid (the
+  // table OID) is set in CONCURRENTLY's first transaction, well before the long scans, so it's a
+  // reliable signal for nearly the whole build. Correlating on the table is enough because the queue
+  // only ever runs one in_progress command at a time.
+  const liveBuild = (tableCol: string) => `EXISTS (
+    SELECT 1 FROM pg_stat_progress_create_index p
+    WHERE p.datname = current_database()
+      AND p.relid = to_regclass(quote_ident('${schema}') || '.' || quote_ident(${tableCol}))
+  )`
+  const stale = (startedCol: string, tableCol: string) => `(
+    ${startedCol} < now() - interval '${BAM_STALE_SECONDS} seconds'
+    OR (${startedCol} < now() - interval '${BAM_LIVENESS_GRACE_SECONDS} seconds' AND NOT ${liveBuild(tableCol)})
+  )`
+
   return `
-    UPDATE ${schema}.bam
-    SET status = 'in_progress', started_on = now()
-    WHERE id = (
-      SELECT id FROM ${schema}.bam
+    WITH candidate AS (
+      SELECT c.id, c.status AS prior_status
+      FROM ${schema}.bam c
       WHERE (
-        status IN ('pending', 'failed')
-        OR (status = 'in_progress' AND started_on < now() - interval '${BAM_STALE_SECONDS} seconds')
+        c.status IN ('pending', 'failed')
+        OR (c.status = 'in_progress' AND ${stale('c.started_on', 'c.table_name')})
       )
       AND NOT EXISTS (
-        SELECT 1 FROM ${schema}.bam
-        WHERE status = 'in_progress' AND started_on >= now() - interval '${BAM_STALE_SECONDS} seconds'
+        SELECT 1 FROM ${schema}.bam g
+        WHERE g.status = 'in_progress' AND NOT ${stale('g.started_on', 'g.table_name')}
       )
-      -- Process all 'pending' commands (oldest first) before retrying any 'failed' or stale
-      -- 'in_progress' one, so a permanently-failing (or crashed-mid-flight) command can't sit at
-      -- the head of the queue and starve everything behind it (head-of-line blocking). Within a
-      -- status, created_on preserves enqueue order.
-      ORDER BY (status != 'pending'), created_on
+      ORDER BY (c.status != 'pending'), c.created_on
       LIMIT 1
     )
-    RETURNING id, name, version, status, queue, table_name as "table", command, error,
-              created_on as "createdOn", started_on as "startedOn", completed_on as "completedOn"
+    UPDATE ${schema}.bam b
+    SET status = 'in_progress', started_on = now()
+    FROM candidate
+    WHERE b.id = candidate.id
+    RETURNING b.id, b.name, b.version, b.status, b.queue, b.table_name as "table", b.command, b.error,
+              b.created_on as "createdOn", b.started_on as "startedOn", b.completed_on as "completedOn",
+              -- reattempt: was this command already tried once (stale-reclaimed in_progress OR a prior
+              -- 'failed')? Either way an interrupted/failed CREATE INDEX CONCURRENTLY may have left an
+              -- INVALID index, so the runner heals (drop-then-rebuild) before re-running. Fresh
+              -- 'pending' rows have nothing to heal.
+              (candidate.prior_status <> 'pending') as reattempt
   `
+}
+
+// Derives the drop-then-rebuild heal step for a re-attempted BAM index build: an interrupted
+// CREATE INDEX CONCURRENTLY leaves an INVALID index in the catalog, and the command's own
+// IF NOT EXISTS would then skip forever (marking the row done while the index stays invalid).
+// Dropping it first lets the re-run rebuild cleanly. Returns null for non-index commands (which
+// have nothing to heal) so the caller just re-runs them. DROP ... CONCURRENTLY runs outside a
+// transaction, matching the CREATE, and IF EXISTS makes it a no-op when there's nothing to drop.
+export function bamHealDrop (schema: string, command: string): string | null {
+  const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?("?[\w$]+"?)/i)
+  if (!match) return null
+  return `DROP INDEX CONCURRENTLY IF EXISTS ${schema}.${match[1]}`
 }
 
 export function setBamCompleted (schema: string, id: string) {

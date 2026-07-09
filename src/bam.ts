@@ -101,6 +101,19 @@ class Bam extends EventEmitter implements types.EventsMixin {
     })
 
     try {
+      // A re-attempted command (a stale in_progress reclaim, or a retry of a prior 'failed' — including
+      // failed rows left by older releases) may have an INVALID index behind it from an interrupted or
+      // failed CREATE INDEX CONCURRENTLY. Drop it first (best-effort, IF EXISTS) so the re-run rebuilds
+      // cleanly instead of the command's own IF NOT EXISTS skipping over a broken index forever. Only on
+      // the liveness path — CockroachDB/YugabyteDB roll interrupted builds back, so there's nothing to
+      // heal and DROP ... CONCURRENTLY isn't their model.
+      if (entry.reattempt && !this.#config.noIndexProgressView) {
+        const dropSql = plans.bamHealDrop(this.#config.schema, entry.command)
+        if (dropSql) {
+          await this.#db.executeSql(dropSql)
+        }
+      }
+
       await this.#db.executeSql(entry.command)
 
       if (this.#stopped) return
@@ -133,7 +146,7 @@ class Bam extends EventEmitter implements types.EventsMixin {
   }
 
   async #getNextCommand (): Promise<types.BamEntry | null> {
-    const sql = plans.getNextBamCommand(this.#config.schema)
+    const sql = plans.getNextBamCommand(this.#config.schema, { useLiveness: !this.#config.noIndexProgressView })
     const { rows } = await this.#db.executeSql(sql)
     return rows[0] || null
   }

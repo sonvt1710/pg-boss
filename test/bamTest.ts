@@ -221,8 +221,8 @@ describe('bam', function () {
 
       // A process that claimed this command died mid-flight, leaving it 'in_progress'. Nothing ever
       // resets it, and getNextBamCommand's NOT EXISTS(in_progress) guard would block every future
-      // command behind it. Backdated past BAM_STALE_SECONDS (4h) so it must be reclaimed.
-      await insertBamRow(ctx.schema, 'stale_cmd', 'in_progress', 'SELECT 1', 5 * 60 * 60)
+      // command behind it. Backdated past BAM_STALE_SECONDS (24h fallback) so it must be reclaimed.
+      await insertBamRow(ctx.schema, 'stale_cmd', 'in_progress', 'SELECT 1', 25 * 60 * 60)
 
       const done = waitForBamEvent(boss, 'stale_cmd', 'completed')
       await triggerBamPoll(ctx.schema)
@@ -231,6 +231,88 @@ describe('bam', function () {
       const entry = (await boss.getBamEntries()).find((e: any) => e.name === 'stale_cmd')
       helper.assertTruthy(entry)
       expect(entry.status).toBe('completed')
+    }, 10000)
+
+    it('should drop-then-rebuild a reclaimed index build so an invalid leftover is healed', async function () {
+      const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig })
+      boss.on('error', () => {})
+
+      const db = await helper.getDb()
+      // Stand in for the invalid index a crashed CONCURRENTLY build would leave: a same-named index
+      // on a DIFFERENT column. A bare re-run of the command's `IF NOT EXISTS` would see the name and
+      // skip, leaving the wrong index in place; healing must drop it and rebuild on the right column.
+      await db.executeSql(`CREATE TABLE ${ctx.schema}.heal_test (a int, b int)`)
+      await db.executeSql(`CREATE INDEX heal_idx ON ${ctx.schema}.heal_test (a)`)
+
+      const command = `CREATE INDEX CONCURRENTLY IF NOT EXISTS heal_idx ON ${ctx.schema}.heal_test (b)`
+      await insertBamRow(ctx.schema, 'heal_cmd', 'in_progress', command, 25 * 60 * 60)
+
+      const done = waitForBamEvent(boss, 'heal_cmd', 'completed')
+      await triggerBamPoll(ctx.schema)
+      await done
+
+      const { rows } = await db.executeSql(
+        `SELECT indexdef FROM pg_indexes WHERE schemaname = '${ctx.schema}' AND indexname = 'heal_idx'`
+      )
+      await db.close()
+
+      // Rebuilt on (b): healing dropped the stale (a) index first.
+      expect(rows).toHaveLength(1)
+      expect(rows[0].indexdef).toContain('(b)')
+      expect(rows[0].indexdef).not.toContain('(a)')
+    }, 10000)
+
+    it('should heal a prior failed index build on retry (e.g. rows left by older releases)', async function () {
+      const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig })
+      boss.on('error', () => {})
+
+      const db = await helper.getDb()
+      await db.executeSql(`CREATE TABLE ${ctx.schema}.heal_test (a int, b int)`)
+      await db.executeSql(`CREATE INDEX heal_idx ON ${ctx.schema}.heal_test (a)`)
+
+      // A 'failed' row (as an older release, or a genuinely-failed CONCURRENTLY build, would leave)
+      // must also heal on retry — otherwise the command's IF NOT EXISTS skips the stale index forever.
+      const command = `CREATE INDEX CONCURRENTLY IF NOT EXISTS heal_idx ON ${ctx.schema}.heal_test (b)`
+      await insertBamRow(ctx.schema, 'failed_cmd', 'failed', command)
+
+      const done = waitForBamEvent(boss, 'failed_cmd', 'completed')
+      await triggerBamPoll(ctx.schema)
+      await done
+
+      const { rows } = await db.executeSql(
+        `SELECT indexdef FROM pg_indexes WHERE schemaname = '${ctx.schema}' AND indexname = 'heal_idx'`
+      )
+      await db.close()
+
+      expect(rows).toHaveLength(1)
+      expect(rows[0].indexdef).toContain('(b)')
+      expect(rows[0].indexdef).not.toContain('(a)')
+    }, 10000)
+
+    it('should not heal on backends without pg_stat_progress_create_index (timeout-only reclaim)', async function () {
+      const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig, __test__noIndexProgressView: true })
+      boss.on('error', () => {})
+
+      const db = await helper.getDb()
+      await db.executeSql(`CREATE TABLE ${ctx.schema}.heal_test (a int, b int)`)
+      await db.executeSql(`CREATE INDEX heal_idx ON ${ctx.schema}.heal_test (a)`)
+
+      // Same reclaim, but no liveness backend → no drop-then-rebuild. The command's IF NOT EXISTS
+      // sees heal_idx and skips, so the pre-existing (a) index survives untouched.
+      const command = `CREATE INDEX CONCURRENTLY IF NOT EXISTS heal_idx ON ${ctx.schema}.heal_test (b)`
+      await insertBamRow(ctx.schema, 'heal_cmd', 'in_progress', command, 25 * 60 * 60)
+
+      const done = waitForBamEvent(boss, 'heal_cmd', 'completed')
+      await triggerBamPoll(ctx.schema)
+      await done
+
+      const { rows } = await db.executeSql(
+        `SELECT indexdef FROM pg_indexes WHERE schemaname = '${ctx.schema}' AND indexname = 'heal_idx'`
+      )
+      await db.close()
+
+      expect(rows).toHaveLength(1)
+      expect(rows[0].indexdef).toContain('(a)')
     }, 10000)
 
     it('should not reclaim a fresh in_progress command (guards against double-run)', async function () {

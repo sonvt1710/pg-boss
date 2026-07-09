@@ -18,7 +18,8 @@ const COMPATIBILITY_FLAGS = [
   'noDeferrableConstraints',
   'noAdvisoryLocks',
   'noCoveringIndexes',
-  'noListenNotify'
+  'noListenNotify',
+  'noIndexProgressView'
 ] as const
 
 type CompatibilityFlag = typeof COMPATIBILITY_FLAGS[number]
@@ -45,14 +46,20 @@ const BACKEND_PROFILES: Record<types.BackendProfile, BackendDefinition> = {
       noDeferrableConstraints: true,
       noAdvisoryLocks: true,
       noCoveringIndexes: true,
-      noListenNotify: true
+      noListenNotify: true,
+      // Online DDL runs as a schema-change job, not the PG CONCURRENTLY path, and
+      // pg_stat_progress_create_index isn't available — so BAM can't use liveness-based reclaim.
+      noIndexProgressView: true
     }
   },
   yugabytedb: {
     kind: 'distributed',
     flags: {
       noAdvisoryLocks: true,
-      noTablePartitioning: true
+      noTablePartitioning: true,
+      // Index builds are a distributed backfill that pg_stat_progress_create_index doesn't reflect,
+      // so liveness would misread an in-flight build as dead. BAM falls back to the timeout instead.
+      noIndexProgressView: true
     }
   },
   citus: { kind: 'distributed', flags: {} },
@@ -491,6 +498,12 @@ function resolveBackend (config: any) {
   // plain Postgres instance, without standing up a backend whose profile sets the flag.
   if (config.__test__noAdvisoryLocks) {
     config.noAdvisoryLocks = true
+  }
+
+  // Test hook: exercise the no-liveness BAM reclaim path (timeout-only, no CONCURRENTLY healing)
+  // used by CockroachDB/YugabyteDB, on a plain Postgres instance.
+  if (config.__test__noIndexProgressView) {
+    config.noIndexProgressView = true
   }
 }
 

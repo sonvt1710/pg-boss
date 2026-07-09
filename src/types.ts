@@ -198,6 +198,13 @@ export interface CompatibilityFlags {
    * support cluster-wide LISTEN/NOTIFY, so it does NOT set this flag.)
    */
   noListenNotify?: boolean;
+  /**
+   * The engine lacks (or doesn't populate) `pg_stat_progress_create_index`, so BAM can't tell
+   * whether a stuck `in_progress` index build is still running. Set for CockroachDB/YugabyteDB,
+   * whose online-DDL job model isn't the PG `CONCURRENTLY` path. When set, BAM reclaims stale
+   * commands on the timeout alone and skips drop-then-rebuild healing.
+   */
+  noIndexProgressView?: boolean;
 }
 
 export interface Migration {
@@ -271,6 +278,13 @@ export interface ConstructorOptions extends DatabaseOptions, SchedulingOptions, 
    * @internal
    */
   __test__noAdvisoryLocks?: boolean;
+  /**
+   * Force `noIndexProgressView` on top of the current backend, so the timeout-only BAM reclaim path
+   * (no liveness, no CONCURRENTLY healing — the one CockroachDB/YugabyteDB take) can be exercised on
+   * a plain Postgres instance.
+   * @internal
+   */
+  __test__noIndexProgressView?: boolean;
   /** @internal */
   migrations?: Migration[];
 }
@@ -923,6 +937,10 @@ export interface BamEntry {
   createdOn: Date
   startedOn?: Date
   completedOn?: Date
+  // True when getNextBamCommand re-picked a command that was already attempted — a stale in_progress
+  // row (prior claimer died mid-run) or a prior 'failed' row (including ones left by older releases) —
+  // signalling that healing (drop-then-rebuild) may be needed. Only set on the liveness path.
+  reattempt?: boolean
 }
 
 export interface BamStatusSummary {
