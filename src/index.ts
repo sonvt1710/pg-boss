@@ -480,6 +480,10 @@ export class PgBoss extends EventEmitter<types.PgBossEventMap> {
     return this.#contractor.schemaVersion()
   }
 
+  detectSchemaDrift (): Promise<types.SchemaDriftReport> {
+    return this.#contractor.detectDrift()
+  }
+
   schedule (name: string, cron: string, data?: object | null, options?: types.ScheduleOptions): Promise<void> {
     return this.#timekeeper.schedule(name, cron, data, options)
   }
@@ -537,6 +541,7 @@ export type {
   GroupOptions,
   IDatabase as Db,
   InsertOptions,
+  InvalidIndex,
   Job,
   JobFetchOptions,
   JobInsert,
@@ -549,6 +554,8 @@ export type {
   Events,
   JobWithMetadata,
   MaintenanceOptions,
+  ManagedIndex,
+  MismatchedIndex,
   OffWorkOptions,
   PgBossEventMap,
   Queue,
@@ -562,6 +569,7 @@ export type {
   Schedule,
   ScheduleOptions,
   SchedulingOptions,
+  SchemaDriftReport,
   SendOptions,
   StopOptions,
   UpdateOptions,

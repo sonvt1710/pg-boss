@@ -139,3 +139,48 @@ Array of objects with the following properties:
 | `createdOn` | Date | When the entry was created |
 | `startedOn` | Date | When execution started |
 | `completedOn` | Date | When execution completed |
+
+### `detectSchemaDrift()`
+
+Compares the managed indexes pg-boss expects against what actually exists in the database and reports any drift. Use it to catch indexes that were dropped, left `INVALID` by an interrupted build, altered, or otherwise diverged from the version pg-boss installed — for example after a manual schema change or a failed migration.
+
+The scan is catalog-only (no locks, no table scans) and covers presence, key-column order, and partial-index predicates. Partitioned vs. non-partitioned and per-queue policy indexes are read from the live database, so conditional indexes are handled. Index predicates that are not simple boolean conjunctions and non-index objects (tables, columns, constraints, functions) are out of scope.
+
+```js
+const report = await boss.detectSchemaDrift()
+// {
+//   ok: false,
+//   missing: [ { name: 'job_common_i5', table: 'job_common' } ],
+//   building: [],
+//   invalid: [],
+//   unexpected: [],
+//   mismatched: [
+//     {
+//       name: 'job_common_i9',
+//       table: 'job_common',
+//       differs: ['predicate'],
+//       expectedKeys: 'name,id',
+//       actualKeys: 'name,id',
+//       expectedPredicate: "blockingandstate='completed'",
+//       actualPredicate: "blockingandstate='active'"
+//     }
+//   ]
+// }
+```
+
+**Returns**
+
+An object with the following properties:
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `ok` | boolean | `true` when nothing is missing, invalid, unexpected, or mismatched |
+| `missing` | array | Expected indexes with no matching catalog entry (excludes any a BAM row is still building) |
+| `building` | array | Expected indexes still being built by a pending/in&#95;progress/failed BAM row — not yet drift |
+| `invalid` | array | Present indexes marked `INVALID` by an interrupted `CREATE INDEX CONCURRENTLY` (each has a `building` flag) |
+| `unexpected` | array | Present indexes matching pg-boss's naming that the expected set does not account for (e.g. a stale policy index) |
+| `mismatched` | array | Present indexes whose key columns/order or predicate differ from the expected definition |
+
+Each entry carries at least `name` and `table`. `mismatched` entries also include `expectedKeys`/`actualKeys`, `expectedPredicate`/`actualPredicate`, and `differs` (`['keys']`, `['predicate']`, or both). Key and predicate strings are normalized for comparison, so they will not match the raw SQL character-for-character.
+
+The [`doctor`](../cli#doctor) CLI command runs this same check without writing any application code.

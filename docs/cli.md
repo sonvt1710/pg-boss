@@ -24,8 +24,26 @@ npx pg-boss --help
 | `migrate` | Run pending migrations (creates schema if not exists) |
 | `create` | Create initial pg-boss schema |
 | `version` | Show current schema version |
+| `doctor` | Check for index drift against the expected schema |
 | `rollback` | Rollback the last migration |
 | `plans <subcommand>` | Output SQL without executing (subcommands: `create`, `migrate`, `rollback`) |
+
+### `doctor`
+
+Compares the indexes pg-boss expects against the live database and reports any missing, invalid, unexpected, or mismatched (wrong key order or predicate) indexes. It exits `0` when the schema is clean and `1` when drift is found (or pg-boss is not installed), so it can gate a deploy. This is the CLI wrapper around [`detectSchemaDrift()`](api/ops#detectschemadrift).
+
+```bash
+pg-boss doctor --connection-string postgres://localhost/myapp
+```
+
+```
+Schema "pgboss" version 37 (latest: 37)
+
+MISSING (expected but absent) (1):
+  job_common.job_common_i5
+
+✗ Schema drift detected
+```
 
 ## Connection Configuration
 
@@ -92,6 +110,9 @@ pg-boss migrate --connection-string postgres://localhost/myapp --dry-run
 
 # Check current schema version
 pg-boss version -c postgres://localhost/myapp
+
+# Check for schema/index drift (exits 1 if drift is found)
+pg-boss doctor -c postgres://localhost/myapp
 
 # Use a custom schema name
 pg-boss migrate -c postgres://localhost/myapp --schema myapp_jobs

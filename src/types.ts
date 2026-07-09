@@ -949,6 +949,56 @@ export interface BamStatusSummary {
   lastCreatedOn: Date
 }
 
+/** One managed index pg-boss expects to exist, and the table it belongs to. */
+export interface ManagedIndex {
+  name: string
+  table: string
+  /** Normalised expected key-column list (ordered), for definition-diff. Absent if not derivable. */
+  keys?: string
+  /** Normalised expected partial-index predicate (the WHERE clause), '' for a non-partial index. */
+  predicate?: string
+}
+
+/** A managed index that is present in the catalog but marked INVALID. */
+export interface InvalidIndex extends ManagedIndex {
+  /** True when a pending/in_progress/failed BAM row is (re)building it, so it may heal itself. */
+  building: boolean
+}
+
+/** A present index whose key columns/order or predicate differ from what the code expects. */
+export interface MismatchedIndex extends ManagedIndex {
+  /** Normalised key-column list the code expects. */
+  expectedKeys: string
+  /** Normalised key-column list actually in the catalog. */
+  actualKeys: string
+  /** Normalised predicate the code expects ('' for a non-partial index). */
+  expectedPredicate: string
+  /** Normalised predicate actually in the catalog ('' for a non-partial index). */
+  actualPredicate: string
+  /** Which parts differ — 'keys', 'predicate', or both. */
+  differs: Array<'keys' | 'predicate'>
+}
+
+/**
+ * Result of a presence-level schema drift scan: managed indexes that should exist per the code's
+ * expected shape vs. what the live catalog actually holds. Definition-level drift (a present index
+ * whose columns/predicate differ) is out of scope here.
+ */
+export interface SchemaDriftReport {
+  /** True when nothing is missing, invalid, or unexpected — schema matches the expected shape. */
+  ok: boolean
+  /** Expected indexes with no matching catalog entry (excludes ones a BAM row is still building). */
+  missing: ManagedIndex[]
+  /** Expected indexes still being built by a pending/in_progress/failed BAM row — not yet drift. */
+  building: ManagedIndex[]
+  /** Present indexes marked INVALID (interrupted CREATE INDEX CONCURRENTLY). */
+  invalid: InvalidIndex[]
+  /** Present indexes matching pg-boss's `_iN` naming that the expected set does not account for. */
+  unexpected: ManagedIndex[]
+  /** Present indexes whose key columns/order differ from the expected definition. */
+  mismatched: MismatchedIndex[]
+}
+
 export interface FlowEvent {
   table: string
   resolved: number

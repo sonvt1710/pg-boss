@@ -32,6 +32,7 @@ Commands:
   migrate     Run pending migrations (creates schema if not exists)
   create      Create the pg-boss schema (initial installation)
   version     Show current schema version
+  doctor      Check for schema/index drift against the expected shape
   plans       Output SQL plans without executing
   rollback    Rollback the last migration
 
@@ -368,6 +369,83 @@ async function cmdRollback (args: ReturnType<typeof parseCliArgs>): Promise<void
   }
 }
 
+async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> {
+  const config = getConnectionConfig(args)
+  const schema = config.schema || plans.DEFAULT_SCHEMA
+  const db = await createDb(config)
+
+  try {
+    const version = await getSchemaVersion(db, schema)
+    if (version === null) {
+      console.log(`pg-boss is not installed in schema "${schema}"`)
+      process.exitCode = 1
+      return
+    }
+
+    console.log(`Schema "${schema}" version ${version} (latest: ${schemaVersion})`)
+    if (version < schemaVersion) {
+      console.log(`⚠ Migrations pending: ${schemaVersion - version} — run "pg-boss migrate" before trusting drift results`)
+    }
+
+    // Read partitioned vs. non-partitioned from the database, then compute the expected index set.
+    const probe = await db.executeSql(plans.jobCommonExists(schema))
+    const partitioned = !!probe.rows[0].name
+    const partitions = partitioned
+      ? (await db.executeSql(plans.getManagedQueuePartitions(schema))).rows
+      : []
+    const live = (await db.executeSql(plans.getSchemaIndexes(schema))).rows
+
+    let bamCommands: string[] = []
+    try {
+      bamCommands = (await db.executeSql(plans.getIncompleteBamCommands(schema))).rows.map((r: { command: string }) => r.command)
+    } catch {
+      // pre-v27 schema without a bam table
+    }
+
+    const expected = plans.expectedManagedIndexes(partitioned, partitions)
+    const report = plans.computeSchemaDrift(expected, live, bamCommands)
+
+    const printSection = (label: string, items: { name: string, table: string }[]) => {
+      if (!items.length) return
+      console.log(`\n${label} (${items.length}):`)
+      for (const i of items) {
+        console.log(`  ${i.table}.${i.name}`)
+      }
+    }
+
+    if (report.building.length) {
+      printSection('Building (async index build in progress — not yet drift)', report.building)
+    }
+
+    if (report.ok) {
+      console.log('\n✓ No index drift detected')
+      return
+    }
+
+    printSection('MISSING (expected but absent)', report.missing)
+    printSection('INVALID (present but marked invalid — needs rebuild)', report.invalid)
+    printSection('UNEXPECTED (pg-boss-named index not in the expected set)', report.unexpected)
+    if (report.mismatched.length) {
+      console.log(`\nMISMATCHED (definition differs) (${report.mismatched.length}):`)
+      for (const m of report.mismatched) {
+        console.log(`  ${m.table}.${m.name} [${m.differs.join(', ')}]`)
+        if (m.differs.includes('keys')) {
+          console.log(`    keys expected: (${m.expectedKeys})`)
+          console.log(`    keys actual:   (${m.actualKeys})`)
+        }
+        if (m.differs.includes('predicate')) {
+          console.log(`    where expected: ${m.expectedPredicate || '(none)'}`)
+          console.log(`    where actual:   ${m.actualPredicate || '(none)'}`)
+        }
+      }
+    }
+    console.log('\n✗ Schema drift detected')
+    process.exitCode = 1
+  } finally {
+    await db.close()
+  }
+}
+
 async function cmdPlans (args: ReturnType<typeof parseCliArgs>): Promise<void> {
   const fileConfig = loadConfigFile(args.config)
   const schema = args.schema || process.env.PGBOSS_SCHEMA || fileConfig.schema || plans.DEFAULT_SCHEMA
@@ -433,6 +511,10 @@ async function main (): Promise<void> {
     switch (args.command) {
       case 'version':
         await cmdVersion(args)
+        break
+
+      case 'doctor':
+        await cmdDoctor(args)
         break
 
       case 'create':

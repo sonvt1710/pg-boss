@@ -56,6 +56,40 @@ class Contractor {
     }
   }
 
+  // Presence-level schema drift scan: compares the managed indexes the code expects against the live
+  // catalog. Partitioned vs. non-partitioned is read from the database (job_common presence), and the
+  // per-queue policy indexes are computed from the queue table, so conditional indexes are handled.
+  async detectDrift (): Promise<types.SchemaDriftReport> {
+    const schema = this.config.schema
+
+    const probe = await this.db.executeSql(plans.jobCommonExists(schema))
+    const partitioned = !!probe.rows[0].name
+
+    const partitions = partitioned
+      ? (await this.db.executeSql(plans.getManagedQueuePartitions(schema))).rows
+      : []
+
+    const liveResult = await this.db.executeSql(plans.getSchemaIndexes(schema))
+    const live = liveResult.rows.map((r: { name: string, table: string, valid: boolean, def: string }) => ({
+      name: r.name,
+      table: r.table,
+      valid: r.valid,
+      def: r.def
+    }))
+
+    // The bam table only exists from schema v27; ignore its absence on very old schemas.
+    let bamCommands: string[] = []
+    try {
+      const bamResult = await this.db.executeSql(plans.getIncompleteBamCommands(schema))
+      bamCommands = bamResult.rows.map((r: { command: string }) => r.command)
+    } catch {
+      bamCommands = []
+    }
+
+    const expected = plans.expectedManagedIndexes(partitioned, partitions)
+    return plans.computeSchemaDrift(expected, live, bamCommands)
+  }
+
   async check () {
     const installed = await this.isInstalled()
 

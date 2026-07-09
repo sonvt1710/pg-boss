@@ -1,4 +1,4 @@
-import type { JobMatchStrategy, UpdateQueueOptions } from './types.ts'
+import type { JobMatchStrategy, UpdateQueueOptions, ManagedIndex, InvalidIndex, MismatchedIndex, SchemaDriftReport } from './types.ts'
 
 export interface SqlQuery {
   text: string
@@ -63,6 +63,114 @@ const QUEUE_DEFAULTS = {
 }
 
 const COMMON_JOB_TABLE = 'job_common'
+
+// job_iN partial indexes that gate on a queue policy: a per-queue partition table (partition:true)
+// only receives the index for its own policy (see create_queue, createQueueFunction). The shared
+// job_common table and a non-partitioned job table carry all of them at once. Keep in sync with the
+// createIndexJobPolicy* builders and the ELSIF ladder in createQueueFunction.
+const POLICY_JOB_INDEXES: Record<number, string> = {
+  1: QUEUE_POLICIES.short,
+  2: QUEUE_POLICIES.singleton,
+  3: QUEUE_POLICIES.stately,
+  6: QUEUE_POLICIES.exclusive,
+  8: QUEUE_POLICIES.key_strict_fifo
+}
+// job_iN indexes with no policy gate — created on every job table regardless of policy
+// (throttle i4, fetch i5, group-concurrency i7, blocking i9).
+const BASE_JOB_INDEXES = [4, 5, 7, 9]
+const ALL_JOB_INDEXES = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+// Static managed indexes that always exist, one per non-job managed table. `ddl` is a thunk so the
+// generator (declared later in the file) is only invoked at call time; the schema is irrelevant to
+// the key-column list a definition-diff compares.
+const STATIC_MANAGED_INDEXES: ReadonlyArray<{ name: string, table: string, ddl: () => string }> = [
+  { name: 'warning_i1', table: 'warning', ddl: () => createIndexWarning('x') },
+  { name: 'queue_stats_i1', table: 'queue_stats', ddl: () => createIndexQueueStats('x') },
+  { name: 'job_dep_parent_idx', table: 'job_dependency', ddl: () => createIndexJobDependencyParent('x') }
+]
+
+// The CREATE INDEX DDL builder for each job_iN index, by index number — used to derive the expected
+// key-column list and predicate. job_table_format rewrites only the table and index name for
+// partitions, never the key columns or predicate, so both are a function of the index number alone.
+// (The referenced builders are hoisted function declarations, so this map is safe to initialise here.)
+const JOB_INDEX_DDL: Record<number, (schema: string) => string> = {
+  1: createIndexJobPolicyShort,
+  2: createIndexJobPolicySingleton,
+  3: createIndexJobPolicyStately,
+  4: createIndexJobThrottle,
+  5: createIndexJobFetch,
+  6: createIndexJobPolicyExclusive,
+  7: createIndexJobGroupConcurrency,
+  8: createIndexJobPolicyKeyStrictFifo,
+  9: createIndexJobBlocking
+}
+function jobIndexDdl (n: number): string {
+  return JOB_INDEX_DDL[n]('x')
+}
+
+// Extracts the first balanced parenthesised group from a CREATE INDEX statement — the key-column
+// list. Stops at the matching close paren, so a trailing INCLUDE(...) or WHERE(...) is excluded and
+// an inner COALESCE(...) is kept. Works on both hand-written DDL and pg_get_indexdef output (whose
+// leading `USING btree (` opens the same first group).
+function extractIndexKeyList (ddl: string): string | null {
+  const open = ddl.indexOf('(')
+  if (open === -1) return null
+  let depth = 0
+  for (let i = open; i < ddl.length; i++) {
+    if (ddl[i] === '(') depth++
+    else if (ddl[i] === ')' && --depth === 0) return ddl.slice(open + 1, i)
+  }
+  return null
+}
+
+// Strips SQL type casts, including schema-qualified enum casts (Postgres renders a job_state literal
+// as `'active'::pgboss.job_state` and a text literal as `''::text`). Run before whitespace removal is
+// fine — casts never contain spaces.
+const CAST_REGEX = /::(?:[a-z_][a-z0-9_$]*\.)?[a-z_][a-z0-9_$]*(?:\[\])?/g
+
+// Normalises a key-column list so an expected list and a pg_get_indexdef list compare equal when they
+// mean the same thing: lower-cased, quotes and whitespace stripped, and type casts removed. Column
+// ORDER is preserved — an index on (a, b) must not normalise equal to (b, a), which is exactly the
+// index-ordinal significance the drift check needs. Parens are kept so COALESCE(...) survives.
+function normalizeKeyList (keyList: string): string {
+  return keyList
+    .toLowerCase()
+    .replace(/"/g, '')
+    .replace(/\s+/g, '')
+    .replace(CAST_REGEX, '')
+}
+
+export function indexKeys (ddl: string): string {
+  const list = extractIndexKeyList(ddl)
+  return list === null ? '' : normalizeKeyList(list)
+}
+
+// Everything after the top-level WHERE — the partial-index predicate — or '' for a non-partial index.
+function extractPredicate (ddl: string): string {
+  const m = ddl.match(/\bWHERE\b/i)
+  return m ? ddl.slice(m.index! + m[0].length) : ''
+}
+
+// Normalises a predicate so a hand-written WHERE and pg_get_indexdef's canonicalised form compare
+// equal. pg_get_indexdef rewrites predicates heavily, so this undoes each transformation:
+//   - casts added to every literal (`'active'::pgboss.job_state`, `'x'::text`) → stripped
+//   - `IN (a, b)` rendered as `= ANY (ARRAY[a, b])` → folded back to `IN (a, b)`
+//   - redundant parentheses wrapped around every sub-expression → removed
+//   - case/whitespace differences → normalised away
+// Parens are dropped entirely, so this only stays sound for flat boolean predicates (the pg-boss set
+// is all conjunctions of simple comparisons); mixed AND/OR grouping is out of scope.
+function normalizePredicate (predicate: string): string {
+  return predicate
+    .toLowerCase()
+    .replace(/"/g, '')
+    .replace(CAST_REGEX, '')
+    .replace(/=\s*any\s*\(\s*array\s*\[([^\]]*)\]\s*\)/g, 'in ($1)')
+    .replace(/[()]/g, '')
+    .replace(/\s+/g, '')
+}
+
+export function indexPredicate (ddl: string): string {
+  return normalizePredicate(extractPredicate(ddl))
+}
 
 interface CreateOptions {
   createSchema?: boolean
@@ -1228,6 +1336,155 @@ export function versionTableExists (schema: string) {
 
 export function getPartitionedQueueTables (schema: string) {
   return `SELECT table_name FROM ${schema}.queue WHERE partition = true`
+}
+
+// --- schema drift detection (presence level) ---
+
+// Probe for the default partition; its presence means the partitioned architecture is in use, so
+// drift detection reads it from the live database rather than trusting a boss config flag.
+export function jobCommonExists (schema: string) {
+  return `SELECT to_regclass('${schema}.${COMMON_JOB_TABLE}') as name`
+}
+
+// Per-queue partition tables and their policy, so the expected index set can be computed per table.
+export function getManagedQueuePartitions (schema: string) {
+  return `SELECT table_name as "table", policy FROM ${schema}.queue WHERE partition = true`
+}
+
+// Every index in the schema, with the table it belongs to and whether it is valid. indisvalid is
+// false while an interrupted CREATE INDEX CONCURRENTLY leaves a stub behind. Catalog-only (pg_class/
+// pg_index), so it works on CockroachDB/YugabyteDB too.
+export function getSchemaIndexes (schema: string) {
+  return `
+    SELECT c.relname AS name, t.relname AS "table", i.indisvalid AS valid, pg_get_indexdef(i.indexrelid) AS def
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_class t ON t.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = '${schema.replace(SINGLE_QUOTE_REGEX, "''")}'
+  `
+}
+
+// The CREATE INDEX command text of every BAM row not yet completed — used to tell a genuinely-missing
+// index apart from one an async build is still working on (or retrying after a failure).
+export function getIncompleteBamCommands (schema: string) {
+  return `SELECT command FROM ${schema}.bam WHERE status <> 'completed'`
+}
+
+interface QueuePartition {
+  table: string
+  policy?: string | null
+}
+
+// Computes the set of indexes pg-boss expects to exist. `partitioned` reflects the live database
+// (job_common present ⇒ partitioned architecture), so this needs no boss config. In partitioned mode,
+// job_common carries the full job_iN set and each per-queue partition carries the base set plus its
+// policy index; non-partitioned mode puts the full set directly on `job`. noCoveringIndexes only
+// changes index *definitions*, not names, so it does not affect presence.
+export function expectedManagedIndexes (partitioned: boolean, partitions: QueuePartition[] = []): ManagedIndex[] {
+  const fromDdl = (name: string, table: string, ddl: string): ManagedIndex =>
+    ({ name, table, keys: indexKeys(ddl), predicate: indexPredicate(ddl) })
+  const out: ManagedIndex[] = STATIC_MANAGED_INDEXES.map(i => fromDdl(i.name, i.table, i.ddl()))
+  const jobIndex = (name: string, table: string, n: number): ManagedIndex => fromDdl(name, table, jobIndexDdl(n))
+
+  if (!partitioned) {
+    for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`job_i${n}`, 'job', n))
+    return out
+  }
+
+  for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`${COMMON_JOB_TABLE}_i${n}`, COMMON_JOB_TABLE, n))
+
+  for (const p of partitions) {
+    for (const n of BASE_JOB_INDEXES) out.push(jobIndex(`${p.table}_i${n}`, p.table, n))
+    for (const [n, policy] of Object.entries(POLICY_JOB_INDEXES)) {
+      if (p.policy === policy) out.push(jobIndex(`${p.table}_i${Number(n)}`, p.table, Number(n)))
+    }
+  }
+
+  return out
+}
+
+// pg-boss names its own indexes `<table>_iN` (or the three static names). A catalog index matching
+// that convention but not in the expected set is drift (e.g. a stale policy index left after a
+// queue's policy changed); anything else is a user's own index and is ignored.
+const MANAGED_INDEX_NAME = /_i\d+$/
+function isManagedIndexName (name: string): boolean {
+  return MANAGED_INDEX_NAME.test(name) || STATIC_MANAGED_INDEXES.some(i => i.name === name)
+}
+
+// Extracts the index name a BAM command builds, so an incomplete build can be matched to a missing
+// index. Mirrors the CREATE INDEX shapes bamHealDrop recognises.
+export function bamCommandIndexName (command: string): string | null {
+  const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([\w$]+)"?/i)
+  return match ? match[1] : null
+}
+
+interface LiveIndex {
+  name: string
+  table: string
+  valid: boolean
+  def?: string
+}
+
+// Presence + index definition diff: which managed indexes exist, plus (for present, valid ones) a
+// key-column-order and partial-predicate comparison. Ordinals are treated asymmetrically, the same
+// convention test/pgSchemaHelper.ts encodes — index column ORDER is significant here (an index on
+// (a, b) differs from (b, a)); a future table-column diff must instead normalise ordinal position
+// away.
+// Pure diff: expected vs. live catalog, with in-flight BAM builds pulled out of "missing".
+export function computeSchemaDrift (
+  expected: ManagedIndex[],
+  live: LiveIndex[],
+  incompleteBamCommands: string[] = []
+): SchemaDriftReport {
+  const liveByName = new Map(live.map(i => [i.name, i]))
+  const building = new Set(
+    incompleteBamCommands.map(bamCommandIndexName).filter((n): n is string => n !== null)
+  )
+  const expectedNames = new Set(expected.map(i => i.name))
+
+  const missing: ManagedIndex[] = []
+  const stillBuilding: ManagedIndex[] = []
+  const invalid: InvalidIndex[] = []
+  const mismatched: MismatchedIndex[] = []
+
+  for (const idx of expected) {
+    const found = liveByName.get(idx.name)
+    if (!found) {
+      (building.has(idx.name) ? stillBuilding : missing).push(idx)
+    } else if (!found.valid) {
+      invalid.push({ ...idx, building: building.has(idx.name) })
+    } else if (idx.keys && found.def) {
+      // Definition-diff: a present, valid index whose key columns/order or predicate differ from the
+      // expected shape. Only when the key list parses — an unparseable def is skipped, not falsely
+      // flagged. (An empty actualKeys means we could not parse the def at all; '' is never a real
+      // key list, whereas an empty predicate is legitimate for a non-partial index.)
+      const actualKeys = indexKeys(found.def)
+      if (actualKeys) {
+        const expectedPredicate = idx.predicate ?? ''
+        const actualPredicate = indexPredicate(found.def)
+        const differs: Array<'keys' | 'predicate'> = []
+        if (actualKeys !== idx.keys) differs.push('keys')
+        if (actualPredicate !== expectedPredicate) differs.push('predicate')
+        if (differs.length) {
+          mismatched.push({ ...idx, expectedKeys: idx.keys, actualKeys, expectedPredicate, actualPredicate, differs })
+        }
+      }
+    }
+  }
+
+  const unexpected = live
+    .filter(i => !expectedNames.has(i.name) && isManagedIndexName(i.name))
+    .map(i => ({ name: i.name, table: i.table }))
+
+  return {
+    ok: missing.length === 0 && invalid.length === 0 && unexpected.length === 0 && mismatched.length === 0,
+    missing,
+    building: stillBuilding,
+    invalid,
+    unexpected,
+    mismatched
+  }
 }
 
 export function insertVersion (schema: string, version: number) {
