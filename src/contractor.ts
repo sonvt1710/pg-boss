@@ -1,5 +1,6 @@
 import assert from 'node:assert'
 import * as plans from './plans.ts'
+import * as drifter from './drifter.ts'
 import * as migrationStore from './migrationStore.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import type * as types from './types.ts'
@@ -69,7 +70,7 @@ class Contractor {
       ? (await this.db.executeSql(plans.getManagedQueuePartitions(schema))).rows
       : []
 
-    const liveResult = await this.db.executeSql(plans.getSchemaIndexes(schema))
+    const liveResult = await this.db.executeSql(drifter.getSchemaIndexes(schema))
     const live = liveResult.rows.map((r: { name: string, table: string, valid: boolean, def: string }) => ({
       name: r.name,
       table: r.table,
@@ -86,8 +87,61 @@ class Contractor {
       bamCommands = []
     }
 
-    const expected = plans.expectedManagedIndexes(partitioned, partitions)
-    return plans.computeSchemaDrift(expected, live, bamCommands)
+    // Function-body and enum drift are best-effort: pg_get_functiondef is unsupported on some backends
+    // (CockroachDB), so a failure here leaves those checks empty rather than aborting the whole scan.
+    let liveFunctions: Array<{ name: string, def: string }> = []
+    try {
+      const fnResult = await this.db.executeSql(drifter.getSchemaFunctions(schema))
+      liveFunctions = fnResult.rows.map((r: { name: string, def: string }) => ({ name: r.name, def: r.def }))
+    } catch {
+      liveFunctions = []
+    }
+
+    let enumLabels: string[] = []
+    try {
+      const enumResult = await this.db.executeSql(drifter.getEnumDefinition(schema))
+      enumLabels = enumResult.rows.map((r: { label: string }) => r.label)
+    } catch {
+      enumLabels = []
+    }
+
+    let liveColumns: Array<{ table: string, column: string, default?: string | null, type?: string, notNull?: boolean }> = []
+    try {
+      const colResult = await this.db.executeSql(drifter.getSchemaColumns(schema))
+      liveColumns = colResult.rows.map((r: { table: string, column: string, default: string | null, type: string, notNull: boolean }) =>
+        ({ table: r.table, column: r.column, default: r.default, type: r.type, notNull: r.notNull }))
+    } catch {
+      liveColumns = []
+    }
+
+    let liveConstraints: Array<{ table: string, def: string }> = []
+    try {
+      const conResult = await this.db.executeSql(drifter.getSchemaConstraints(schema))
+      liveConstraints = conResult.rows.map((r: { table: string, def: string }) => ({ table: r.table, def: r.def }))
+    } catch {
+      liveConstraints = []
+    }
+
+    const building = new Set(bamCommands.map(plans.bamCommandIndexName).filter((n): n is string => n !== null))
+
+    // CockroachDB renders column types (INT8 vs integer), default expressions, and constraint
+    // definitions differently from standard Postgres, so the canonical-form checks would false-positive
+    // there. Restrict type/default/constraint drift to Postgres-typed backends; the presence checks
+    // (tables, indexes, column names, functions, enum) still run everywhere.
+    const canonicalPg = this.config.backend !== 'cockroachdb'
+    const expectedColumns = plans.expectedManagedColumns(schema, partitioned, partitions)
+      .map(c => canonicalPg ? c : { table: c.table, columns: c.columns })
+
+    const expected = plans.expectedManagedIndexes(schema, partitioned, partitions)
+    return drifter.computeSchemaDrift(expected, live, {
+      building,
+      isManaged: plans.isManagedIndexName,
+      tables: { expected: plans.expectedManagedTables(schema, partitioned, partitions), live: [...new Set(liveColumns.map(c => c.table))] },
+      functions: { expected: plans.expectedManagedFunctions(schema, partitioned), live: liveFunctions },
+      columns: { expected: expectedColumns, live: liveColumns },
+      constraints: canonicalPg ? { expected: plans.expectedManagedConstraints(schema, partitioned), live: liveConstraints } : undefined,
+      enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: enumLabels }
+    })
   }
 
   async check () {

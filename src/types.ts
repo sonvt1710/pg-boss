@@ -953,13 +953,19 @@ export interface BamStatusSummary {
 export interface ManagedIndex {
   name: string
   table: string
-  /** Normalised expected key-column list (ordered), for definition-diff. Absent if not derivable. */
+  /** Readable expected key-column list (ordered), for definition-diff. Absent if not derivable. */
   keys?: string
-  /** Normalised expected partial-index predicate (the WHERE clause), '' for a non-partial index. */
+  /** Readable expected partial-index predicate (the WHERE clause), '' for a non-partial index. */
   predicate?: string
+  /** The full expected `CREATE INDEX` statement (schema-qualified), ready to run to recreate it. */
+  definition?: string
 }
 
-/** A managed index that is present in the catalog but marked INVALID. */
+/**
+ * A managed index that is present in the catalog but marked INVALID. Its definition is correct (an
+ * interrupted build, not a wrong shape), so only the expected `definition` is carried — there is no
+ * meaningful actual-vs-expected diff to show.
+ */
 export interface InvalidIndex extends ManagedIndex {
   /** True when a pending/in_progress/failed BAM row is (re)building it, so it may heal itself. */
   building: boolean
@@ -967,26 +973,88 @@ export interface InvalidIndex extends ManagedIndex {
 
 /** A present index whose key columns/order or predicate differ from what the code expects. */
 export interface MismatchedIndex extends ManagedIndex {
-  /** Normalised key-column list the code expects. */
+  /** Readable key-column list the code expects. */
   expectedKeys: string
-  /** Normalised key-column list actually in the catalog. */
+  /** Readable key-column list actually in the catalog (from pg_get_indexdef). */
   actualKeys: string
-  /** Normalised predicate the code expects ('' for a non-partial index). */
+  /** Readable predicate the code expects ('' for a non-partial index). */
   expectedPredicate: string
-  /** Normalised predicate actually in the catalog ('' for a non-partial index). */
+  /** Readable predicate actually in the catalog, from pg_get_indexdef ('' for a non-partial index). */
   actualPredicate: string
+  /** The index's current definition from pg_get_indexdef, for side-by-side comparison with `definition`. */
+  actualDefinition: string
   /** Which parts differ — 'keys', 'predicate', or both. */
   differs: Array<'keys' | 'predicate'>
 }
 
+/** One managed plpgsql/sql function pg-boss expects to exist, with its normalised body for diffing. */
+export interface ManagedFunction {
+  name: string
+  /** Whitespace-normalised expected function body (the text between the outer `$$` dollar quotes). */
+  expectedBody: string
+  /** The full expected `CREATE FUNCTION` statement (schema-qualified), ready to run to recreate it. */
+  definition: string
+}
+
+/** A present managed function whose body differs from what the code expects. */
+export interface MismatchedFunction extends ManagedFunction {
+  /** Whitespace-normalised body actually stored in the catalog (from pg_get_functiondef). */
+  actualBody: string
+  /** The function's current definition from pg_get_functiondef, for side-by-side comparison. */
+  actualDefinition: string
+}
+
+/** Column drift for a managed table: columns the code expects that are absent, columns present in the
+ *  catalog that the code does not expect, and (fixed tables only) columns whose default, data type, or
+ *  nullability differs from the code's DDL. */
+export interface TableColumnDrift {
+  /** The (unqualified) table name. */
+  table: string
+  /** Expected columns with no matching catalog column. */
+  missingColumns: string[]
+  /** Catalog columns the expected set does not account for. */
+  unexpectedColumns: string[]
+  /** Columns whose live default expression differs from the code's expected default (fixed tables only). */
+  defaultMismatches: Array<{ column: string, expected: string, actual: string }>
+  /** Columns whose live data type differs from the code's expected type (fixed tables only). */
+  typeMismatches: Array<{ column: string, expected: string, actual: string }>
+  /** Columns whose live NOT NULL flag differs from the code's expectation (fixed tables only). */
+  nullabilityMismatches: Array<{ column: string, expected: boolean, actual: boolean }>
+}
+
+/** Constraint-set drift for a managed table: expected constraints absent from the catalog, and catalog
+ *  constraints the code does not expect. Compared on normalised pg_get_constraintdef strings. */
+export interface ConstraintDrift {
+  /** The (unqualified) table name. */
+  table: string
+  /** Expected constraints with no matching catalog constraint. */
+  missingConstraints: string[]
+  /** Catalog constraint definitions the expected set does not account for. */
+  unexpectedConstraints: string[]
+}
+
+/** Drift in an enum type's value set or ordering (pg-boss's `job_state`). */
+export interface EnumDrift {
+  /** The enum type's name (e.g. `job_state`). */
+  name: string
+  /** Ordered enum labels the code expects. */
+  expectedValues: string[]
+  /** Ordered enum labels actually in the catalog. */
+  actualValues: string[]
+}
+
 /**
- * Result of a presence-level schema drift scan: managed indexes that should exist per the code's
- * expected shape vs. what the live catalog actually holds. Definition-level drift (a present index
- * whose columns/predicate differ) is out of scope here.
+ * Result of a schema drift scan: managed indexes, functions, and enums that should exist per the
+ * code's expected shape vs. what the live catalog actually holds. Covers presence (missing / invalid
+ * / unexpected) and definition-level drift (a present index, function body, or enum whose shape
+ * differs from what the code emits).
  */
 export interface SchemaDriftReport {
-  /** True when nothing is missing, invalid, or unexpected — schema matches the expected shape. */
+  /** True when nothing is missing, invalid, unexpected, mismatched, or drifted (tables, columns,
+   *  defaults, types, constraints, enum) — schema matches the code. */
   ok: boolean
+  /** Expected managed tables with no matching catalog table. */
+  missingTables: string[]
   /** Expected indexes with no matching catalog entry (excludes ones a BAM row is still building). */
   missing: ManagedIndex[]
   /** Expected indexes still being built by a pending/in_progress/failed BAM row — not yet drift. */
@@ -997,6 +1065,16 @@ export interface SchemaDriftReport {
   unexpected: ManagedIndex[]
   /** Present indexes whose key columns/order differ from the expected definition. */
   mismatched: MismatchedIndex[]
+  /** Expected functions with no matching catalog entry. */
+  missingFunctions: ManagedFunction[]
+  /** Present functions whose body differs from the code's expected definition. */
+  mismatchedFunctions: MismatchedFunction[]
+  /** Managed tables with missing/unexpected columns or column-default drift (only differing tables). */
+  columnDrift: TableColumnDrift[]
+  /** Managed tables with missing or unexpected constraints (only tables that differ are listed). */
+  constraintDrift: ConstraintDrift[]
+  /** Enum drift when the live `job_state` value set/order differs from the code; null when it matches. */
+  enumDrift: EnumDrift | null
 }
 
 export interface FlowEvent {

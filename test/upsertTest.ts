@@ -2,10 +2,25 @@ import { expect } from 'vitest'
 import * as helper from './testHelper.ts'
 import { assertTruthy } from './testHelper.ts'
 import { ctx } from './hooks.ts'
+import * as plans from '../src/plans.ts'
 
 const SOME_UUID = '00000000-0000-0000-0000-000000000000'
 
 describe('upsert', function () {
+  // The JSONB key-existence operator `?` collides with knex's positional-binding parser (issue #837:
+  // "Expected 1 bindings, saw 10"). The update SQL must use the jsonb_exists() function form instead.
+  it('generates update SQL free of the ? operator (knex adapter compatibility)', function () {
+    const sqls = [
+      plans.updateJob('pgboss', 'job', 'q', 'id', 'newest'),
+      plans.updateJob('pgboss', 'job', 'q', 'singletonKey', 'all', true),
+      plans.updateQueue('pgboss', { deadLetter: 'dl' })
+    ]
+    for (const sql of sqls) {
+      expect(sql).not.toMatch(/\?/)
+      expect(sql).toContain('jsonb_exists(o.data,')
+    }
+  })
+
   it('should reject when neither id nor singletonKey is provided', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
     await expect(ctx.boss.upsert(ctx.schema, { v: 1 })).rejects.toThrow(/exactly one of id or singletonKey/)

@@ -1,4 +1,15 @@
-import type { JobMatchStrategy, UpdateQueueOptions, ManagedIndex, InvalidIndex, MismatchedIndex, SchemaDriftReport } from './types.ts'
+import type { JobMatchStrategy, UpdateQueueOptions, ManagedIndex, ManagedFunction } from './types.ts'
+import {
+  indexKeysRaw,
+  indexPredicateRaw,
+  tableColumns,
+  tableColumnDefaults,
+  tableColumnTypes,
+  extractFunctionBody,
+  normalizeFunctionBody,
+  functionName
+} from './drifter.ts'
+import type { ExpectedColumns, ExpectedConstraints } from './drifter.ts'
 
 export interface SqlQuery {
   text: string
@@ -12,7 +23,7 @@ export const PG_ERROR = {
 export const DEFAULT_SCHEMA = 'pgboss'
 export const MIGRATE_RACE_MESSAGE = 'division by zero'
 export const CREATE_RACE_MESSAGE = 'already exists'
-const SINGLE_QUOTE_REGEX = /'/g
+export const SINGLE_QUOTE_REGEX = /'/g
 const FIFTEEN_MINUTES = 60 * 15
 const FORTEEN_DAYS = 60 * 60 * 24 * 14
 const SEVEN_DAYS = 60 * 60 * 24 * 7
@@ -62,115 +73,7 @@ const QUEUE_DEFAULTS = {
   partition: false
 }
 
-const COMMON_JOB_TABLE = 'job_common'
-
-// job_iN partial indexes that gate on a queue policy: a per-queue partition table (partition:true)
-// only receives the index for its own policy (see create_queue, createQueueFunction). The shared
-// job_common table and a non-partitioned job table carry all of them at once. Keep in sync with the
-// createIndexJobPolicy* builders and the ELSIF ladder in createQueueFunction.
-const POLICY_JOB_INDEXES: Record<number, string> = {
-  1: QUEUE_POLICIES.short,
-  2: QUEUE_POLICIES.singleton,
-  3: QUEUE_POLICIES.stately,
-  6: QUEUE_POLICIES.exclusive,
-  8: QUEUE_POLICIES.key_strict_fifo
-}
-// job_iN indexes with no policy gate — created on every job table regardless of policy
-// (throttle i4, fetch i5, group-concurrency i7, blocking i9).
-const BASE_JOB_INDEXES = [4, 5, 7, 9]
-const ALL_JOB_INDEXES = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-// Static managed indexes that always exist, one per non-job managed table. `ddl` is a thunk so the
-// generator (declared later in the file) is only invoked at call time; the schema is irrelevant to
-// the key-column list a definition-diff compares.
-const STATIC_MANAGED_INDEXES: ReadonlyArray<{ name: string, table: string, ddl: () => string }> = [
-  { name: 'warning_i1', table: 'warning', ddl: () => createIndexWarning('x') },
-  { name: 'queue_stats_i1', table: 'queue_stats', ddl: () => createIndexQueueStats('x') },
-  { name: 'job_dep_parent_idx', table: 'job_dependency', ddl: () => createIndexJobDependencyParent('x') }
-]
-
-// The CREATE INDEX DDL builder for each job_iN index, by index number — used to derive the expected
-// key-column list and predicate. job_table_format rewrites only the table and index name for
-// partitions, never the key columns or predicate, so both are a function of the index number alone.
-// (The referenced builders are hoisted function declarations, so this map is safe to initialise here.)
-const JOB_INDEX_DDL: Record<number, (schema: string) => string> = {
-  1: createIndexJobPolicyShort,
-  2: createIndexJobPolicySingleton,
-  3: createIndexJobPolicyStately,
-  4: createIndexJobThrottle,
-  5: createIndexJobFetch,
-  6: createIndexJobPolicyExclusive,
-  7: createIndexJobGroupConcurrency,
-  8: createIndexJobPolicyKeyStrictFifo,
-  9: createIndexJobBlocking
-}
-function jobIndexDdl (n: number): string {
-  return JOB_INDEX_DDL[n]('x')
-}
-
-// Extracts the first balanced parenthesised group from a CREATE INDEX statement — the key-column
-// list. Stops at the matching close paren, so a trailing INCLUDE(...) or WHERE(...) is excluded and
-// an inner COALESCE(...) is kept. Works on both hand-written DDL and pg_get_indexdef output (whose
-// leading `USING btree (` opens the same first group).
-function extractIndexKeyList (ddl: string): string | null {
-  const open = ddl.indexOf('(')
-  if (open === -1) return null
-  let depth = 0
-  for (let i = open; i < ddl.length; i++) {
-    if (ddl[i] === '(') depth++
-    else if (ddl[i] === ')' && --depth === 0) return ddl.slice(open + 1, i)
-  }
-  return null
-}
-
-// Strips SQL type casts, including schema-qualified enum casts (Postgres renders a job_state literal
-// as `'active'::pgboss.job_state` and a text literal as `''::text`). Run before whitespace removal is
-// fine — casts never contain spaces.
-const CAST_REGEX = /::(?:[a-z_][a-z0-9_$]*\.)?[a-z_][a-z0-9_$]*(?:\[\])?/g
-
-// Normalises a key-column list so an expected list and a pg_get_indexdef list compare equal when they
-// mean the same thing: lower-cased, quotes and whitespace stripped, and type casts removed. Column
-// ORDER is preserved — an index on (a, b) must not normalise equal to (b, a), which is exactly the
-// index-ordinal significance the drift check needs. Parens are kept so COALESCE(...) survives.
-function normalizeKeyList (keyList: string): string {
-  return keyList
-    .toLowerCase()
-    .replace(/"/g, '')
-    .replace(/\s+/g, '')
-    .replace(CAST_REGEX, '')
-}
-
-export function indexKeys (ddl: string): string {
-  const list = extractIndexKeyList(ddl)
-  return list === null ? '' : normalizeKeyList(list)
-}
-
-// Everything after the top-level WHERE — the partial-index predicate — or '' for a non-partial index.
-function extractPredicate (ddl: string): string {
-  const m = ddl.match(/\bWHERE\b/i)
-  return m ? ddl.slice(m.index! + m[0].length) : ''
-}
-
-// Normalises a predicate so a hand-written WHERE and pg_get_indexdef's canonicalised form compare
-// equal. pg_get_indexdef rewrites predicates heavily, so this undoes each transformation:
-//   - casts added to every literal (`'active'::pgboss.job_state`, `'x'::text`) → stripped
-//   - `IN (a, b)` rendered as `= ANY (ARRAY[a, b])` → folded back to `IN (a, b)`
-//   - redundant parentheses wrapped around every sub-expression → removed
-//   - case/whitespace differences → normalised away
-// Parens are dropped entirely, so this only stays sound for flat boolean predicates (the pg-boss set
-// is all conjunctions of simple comparisons); mixed AND/OR grouping is out of scope.
-function normalizePredicate (predicate: string): string {
-  return predicate
-    .toLowerCase()
-    .replace(/"/g, '')
-    .replace(CAST_REGEX, '')
-    .replace(/=\s*any\s*\(\s*array\s*\[([^\]]*)\]\s*\)/g, 'in ($1)')
-    .replace(/[()]/g, '')
-    .replace(/\s+/g, '')
-}
-
-export function indexPredicate (ddl: string): string {
-  return normalizePredicate(extractPredicate(ddl))
-}
+export const COMMON_JOB_TABLE = 'job_common'
 
 interface CreateOptions {
   createSchema?: boolean
@@ -897,14 +800,14 @@ export function updateQueue (schema: string, { deadLetter }: UpdateQueueOptions 
       retry_limit = COALESCE((o.data->>'retryLimit')::int, retry_limit),
       retry_delay = COALESCE((o.data->>'retryDelay')::int, retry_delay),
       retry_backoff = COALESCE((o.data->>'retryBackoff')::bool, retry_backoff),
-      retry_delay_max = CASE WHEN o.data ? 'retryDelayMax'
+      retry_delay_max = CASE WHEN jsonb_exists(o.data, 'retryDelayMax')
         THEN (o.data->>'retryDelayMax')::int
         ELSE retry_delay_max END,
       expire_seconds = COALESCE((o.data->>'expireInSeconds')::int, expire_seconds),
       retention_seconds = COALESCE((o.data->>'retentionSeconds')::int, retention_seconds),
       deletion_seconds = COALESCE((o.data->>'deleteAfterSeconds')::int, deletion_seconds),
       warning_queued = COALESCE((o.data->>'warningQueueSize')::int, warning_queued),
-      heartbeat_seconds = CASE WHEN o.data ? 'heartbeatSeconds'
+      heartbeat_seconds = CASE WHEN jsonb_exists(o.data, 'heartbeatSeconds')
         THEN (o.data->>'heartbeatSeconds')::int
         ELSE heartbeat_seconds END,
       notify = COALESCE((o.data->>'notify')::bool, notify),
@@ -1083,22 +986,6 @@ export function deleteOldWarnings (schema: string, days: number): string {
 }
 
 export function createTableQueueStats (schema: string, noPartitioning = false): string {
-  if (noPartitioning) {
-    return `
-      CREATE TABLE ${schema}.queue_stats (
-        id uuid NOT NULL DEFAULT gen_random_uuid(),
-        name text NOT NULL,
-        deferred_count int NOT NULL DEFAULT 0,
-        queued_count   int NOT NULL DEFAULT 0,
-        ready_count    int NOT NULL DEFAULT 0,
-        active_count   int NOT NULL DEFAULT 0,
-        failed_count   int NOT NULL DEFAULT 0,
-        total_count    int NOT NULL DEFAULT 0,
-        captured_on timestamptz NOT NULL DEFAULT now(),
-        PRIMARY KEY (id)
-      )
-    `
-  }
   return `
     CREATE TABLE ${schema}.queue_stats (
       id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -1110,23 +997,17 @@ export function createTableQueueStats (schema: string, noPartitioning = false): 
       failed_count   int NOT NULL DEFAULT 0,
       total_count    int NOT NULL DEFAULT 0,
       captured_on timestamptz NOT NULL DEFAULT now(),
-      PRIMARY KEY (id, captured_on)
-    ) PARTITION BY RANGE (captured_on)
+      ${noPartitioning ? 'PRIMARY KEY (id)' : 'PRIMARY KEY (id, captured_on)'}
+    ) ${noPartitioning ? '' : 'PARTITION BY RANGE (captured_on)'}
   `
 }
 
-// queue_stats_i1 serves both the raw history query and the bucketed aggregates: the filter
-// (name = ?, captured_on range) rides the composite key, and the six count columns are carried as
-// covering payload so those reads run index-only (no per-row heap fetch — the dominant cost when an
-// aggregate scans many rows). INCLUDE is gated on the noCoveringIndexes profile flag, which
-// CockroachDB sets (it uses STORING, not INCLUDE) but YugabyteDB does not (it supports INCLUDE):
-// the gated backends keep the plain composite index — correct, just not covering.
 export function createIndexQueueStats (schema: string, noCoveringIndex = false): string {
-  const cols = '(name, captured_on DESC)'
-  const include = 'INCLUDE (deferred_count, queued_count, ready_count, active_count, failed_count, total_count)'
-  return noCoveringIndex
-    ? `CREATE INDEX queue_stats_i1 ON ${schema}.queue_stats ${cols}`
-    : `CREATE INDEX queue_stats_i1 ON ${schema}.queue_stats ${cols} ${include}`
+  const include = noCoveringIndex
+    ? ''
+    : 'INCLUDE (deferred_count, queued_count, ready_count, active_count, failed_count, total_count)'
+
+  return `CREATE INDEX queue_stats_i1 ON ${schema}.queue_stats (name, captured_on DESC) ${include}`
 }
 
 // Idempotently create the daily partitions for today and tomorrow (UTC). Both the day suffix and
@@ -1336,155 +1217,6 @@ export function versionTableExists (schema: string) {
 
 export function getPartitionedQueueTables (schema: string) {
   return `SELECT table_name FROM ${schema}.queue WHERE partition = true`
-}
-
-// --- schema drift detection (presence level) ---
-
-// Probe for the default partition; its presence means the partitioned architecture is in use, so
-// drift detection reads it from the live database rather than trusting a boss config flag.
-export function jobCommonExists (schema: string) {
-  return `SELECT to_regclass('${schema}.${COMMON_JOB_TABLE}') as name`
-}
-
-// Per-queue partition tables and their policy, so the expected index set can be computed per table.
-export function getManagedQueuePartitions (schema: string) {
-  return `SELECT table_name as "table", policy FROM ${schema}.queue WHERE partition = true`
-}
-
-// Every index in the schema, with the table it belongs to and whether it is valid. indisvalid is
-// false while an interrupted CREATE INDEX CONCURRENTLY leaves a stub behind. Catalog-only (pg_class/
-// pg_index), so it works on CockroachDB/YugabyteDB too.
-export function getSchemaIndexes (schema: string) {
-  return `
-    SELECT c.relname AS name, t.relname AS "table", i.indisvalid AS valid, pg_get_indexdef(i.indexrelid) AS def
-    FROM pg_index i
-    JOIN pg_class c ON c.oid = i.indexrelid
-    JOIN pg_class t ON t.oid = i.indrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = '${schema.replace(SINGLE_QUOTE_REGEX, "''")}'
-  `
-}
-
-// The CREATE INDEX command text of every BAM row not yet completed — used to tell a genuinely-missing
-// index apart from one an async build is still working on (or retrying after a failure).
-export function getIncompleteBamCommands (schema: string) {
-  return `SELECT command FROM ${schema}.bam WHERE status <> 'completed'`
-}
-
-interface QueuePartition {
-  table: string
-  policy?: string | null
-}
-
-// Computes the set of indexes pg-boss expects to exist. `partitioned` reflects the live database
-// (job_common present ⇒ partitioned architecture), so this needs no boss config. In partitioned mode,
-// job_common carries the full job_iN set and each per-queue partition carries the base set plus its
-// policy index; non-partitioned mode puts the full set directly on `job`. noCoveringIndexes only
-// changes index *definitions*, not names, so it does not affect presence.
-export function expectedManagedIndexes (partitioned: boolean, partitions: QueuePartition[] = []): ManagedIndex[] {
-  const fromDdl = (name: string, table: string, ddl: string): ManagedIndex =>
-    ({ name, table, keys: indexKeys(ddl), predicate: indexPredicate(ddl) })
-  const out: ManagedIndex[] = STATIC_MANAGED_INDEXES.map(i => fromDdl(i.name, i.table, i.ddl()))
-  const jobIndex = (name: string, table: string, n: number): ManagedIndex => fromDdl(name, table, jobIndexDdl(n))
-
-  if (!partitioned) {
-    for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`job_i${n}`, 'job', n))
-    return out
-  }
-
-  for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`${COMMON_JOB_TABLE}_i${n}`, COMMON_JOB_TABLE, n))
-
-  for (const p of partitions) {
-    for (const n of BASE_JOB_INDEXES) out.push(jobIndex(`${p.table}_i${n}`, p.table, n))
-    for (const [n, policy] of Object.entries(POLICY_JOB_INDEXES)) {
-      if (p.policy === policy) out.push(jobIndex(`${p.table}_i${Number(n)}`, p.table, Number(n)))
-    }
-  }
-
-  return out
-}
-
-// pg-boss names its own indexes `<table>_iN` (or the three static names). A catalog index matching
-// that convention but not in the expected set is drift (e.g. a stale policy index left after a
-// queue's policy changed); anything else is a user's own index and is ignored.
-const MANAGED_INDEX_NAME = /_i\d+$/
-function isManagedIndexName (name: string): boolean {
-  return MANAGED_INDEX_NAME.test(name) || STATIC_MANAGED_INDEXES.some(i => i.name === name)
-}
-
-// Extracts the index name a BAM command builds, so an incomplete build can be matched to a missing
-// index. Mirrors the CREATE INDEX shapes bamHealDrop recognises.
-export function bamCommandIndexName (command: string): string | null {
-  const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([\w$]+)"?/i)
-  return match ? match[1] : null
-}
-
-interface LiveIndex {
-  name: string
-  table: string
-  valid: boolean
-  def?: string
-}
-
-// Presence + index definition diff: which managed indexes exist, plus (for present, valid ones) a
-// key-column-order and partial-predicate comparison. Ordinals are treated asymmetrically, the same
-// convention test/pgSchemaHelper.ts encodes — index column ORDER is significant here (an index on
-// (a, b) differs from (b, a)); a future table-column diff must instead normalise ordinal position
-// away.
-// Pure diff: expected vs. live catalog, with in-flight BAM builds pulled out of "missing".
-export function computeSchemaDrift (
-  expected: ManagedIndex[],
-  live: LiveIndex[],
-  incompleteBamCommands: string[] = []
-): SchemaDriftReport {
-  const liveByName = new Map(live.map(i => [i.name, i]))
-  const building = new Set(
-    incompleteBamCommands.map(bamCommandIndexName).filter((n): n is string => n !== null)
-  )
-  const expectedNames = new Set(expected.map(i => i.name))
-
-  const missing: ManagedIndex[] = []
-  const stillBuilding: ManagedIndex[] = []
-  const invalid: InvalidIndex[] = []
-  const mismatched: MismatchedIndex[] = []
-
-  for (const idx of expected) {
-    const found = liveByName.get(idx.name)
-    if (!found) {
-      (building.has(idx.name) ? stillBuilding : missing).push(idx)
-    } else if (!found.valid) {
-      invalid.push({ ...idx, building: building.has(idx.name) })
-    } else if (idx.keys && found.def) {
-      // Definition-diff: a present, valid index whose key columns/order or predicate differ from the
-      // expected shape. Only when the key list parses — an unparseable def is skipped, not falsely
-      // flagged. (An empty actualKeys means we could not parse the def at all; '' is never a real
-      // key list, whereas an empty predicate is legitimate for a non-partial index.)
-      const actualKeys = indexKeys(found.def)
-      if (actualKeys) {
-        const expectedPredicate = idx.predicate ?? ''
-        const actualPredicate = indexPredicate(found.def)
-        const differs: Array<'keys' | 'predicate'> = []
-        if (actualKeys !== idx.keys) differs.push('keys')
-        if (actualPredicate !== expectedPredicate) differs.push('predicate')
-        if (differs.length) {
-          mismatched.push({ ...idx, expectedKeys: idx.keys, actualKeys, expectedPredicate, actualPredicate, differs })
-        }
-      }
-    }
-  }
-
-  const unexpected = live
-    .filter(i => !expectedNames.has(i.name) && isManagedIndexName(i.name))
-    .map(i => ({ name: i.name, table: i.table }))
-
-  return {
-    ok: missing.length === 0 && invalid.length === 0 && unexpected.length === 0 && mismatched.length === 0,
-    missing,
-    building: stillBuilding,
-    invalid,
-    unexpected,
-    mismatched
-  }
 }
 
 export function insertVersion (schema: string, version: number) {
@@ -2547,7 +2279,7 @@ export function retryJobs (schema: string, table: string) {
 
 // Partial in-place edit of not-yet-active jobs, preserving id/state/singleton identity.
 // The payload ($1) is a jsonb object of ONLY the fields the caller supplied; each column is
-// left untouched unless its key is present (`o.data ? 'key'`), so an update that carries just
+// left untouched unless its key is present (`jsonb_exists(o.data, 'key')`), so an update that carries just
 // `data` never clobbers an existing start_after/priority/etc. Targeting is by id or
 // singleton_key; when by key, `match` picks which of several pre-active matches to edit
 // (newest/oldest = one row via ORDER BY + LIMIT; all = every match). When `notify` is set the
@@ -2565,7 +2297,7 @@ export function updateJob (schema: string, table: string, name: string, by: 'id'
   // Resolve the incoming startAfter the same way insertJobs does (absolute 'Z' timestamp vs.
   // relative interval), falling back to the row's current start_after when not supplied.
   const resolvedStartAfter = `
-        CASE WHEN o.data ? 'startAfter'
+        CASE WHEN jsonb_exists(o.data, 'startAfter')
           THEN CASE WHEN right(o.data->>'startAfter', 1) = 'Z'
                  THEN (o.data->>'startAfter')::timestamptz
                  ELSE now() + CAST(o.data->>'startAfter' AS interval) END
@@ -2592,16 +2324,16 @@ export function updateJob (schema: string, table: string, name: string, by: 'id'
     ),
     upd AS (
       UPDATE ${schema}.${table} job
-      SET data = CASE WHEN o.data ? 'data' THEN o.data->'data' ELSE job.data END,
+      SET data = CASE WHEN jsonb_exists(o.data, 'data') THEN o.data->'data' ELSE job.data END,
           priority = COALESCE((o.data->>'priority')::int, job.priority),
           start_after = ${resolvedStartAfter},
           keep_until = CASE
-            WHEN o.data ? 'retentionSeconds'
+            WHEN jsonb_exists(o.data, 'retentionSeconds')
               THEN (${resolvedStartAfter}) + ((o.data->>'retentionSeconds')::int * interval '1s')
             -- When only start_after moves, slide keep_until by the same original retention window
             -- (keep_until - start_after) so pulling a job forward/back never leaves keep_until in
             -- the past, which the deletion sweep would treat as expired and remove the pending job.
-            WHEN o.data ? 'startAfter'
+            WHEN jsonb_exists(o.data, 'startAfter')
               THEN (${resolvedStartAfter}) + (job.keep_until - job.start_after)
             ELSE job.keep_until END,
           expire_seconds = COALESCE((o.data->>'expireInSeconds')::int, job.expire_seconds),
@@ -2609,11 +2341,11 @@ export function updateJob (schema: string, table: string, name: string, by: 'id'
           retry_limit = COALESCE((o.data->>'retryLimit')::int, job.retry_limit),
           retry_delay = COALESCE((o.data->>'retryDelay')::int, job.retry_delay),
           retry_backoff = COALESCE((o.data->>'retryBackoff')::bool, job.retry_backoff),
-          retry_delay_max = CASE WHEN o.data ? 'retryDelayMax' THEN (o.data->>'retryDelayMax')::int ELSE job.retry_delay_max END,
-          dead_letter = CASE WHEN o.data ? 'deadLetter' THEN o.data->>'deadLetter' ELSE job.dead_letter END,
-          heartbeat_seconds = CASE WHEN o.data ? 'heartbeatSeconds' THEN (o.data->>'heartbeatSeconds')::int ELSE job.heartbeat_seconds END,
-          group_id = CASE WHEN o.data ? 'groupId' THEN o.data->>'groupId' ELSE job.group_id END,
-          group_tier = CASE WHEN o.data ? 'groupTier' THEN o.data->>'groupTier' ELSE job.group_tier END
+          retry_delay_max = CASE WHEN jsonb_exists(o.data, 'retryDelayMax') THEN (o.data->>'retryDelayMax')::int ELSE job.retry_delay_max END,
+          dead_letter = CASE WHEN jsonb_exists(o.data, 'deadLetter') THEN o.data->>'deadLetter' ELSE job.dead_letter END,
+          heartbeat_seconds = CASE WHEN jsonb_exists(o.data, 'heartbeatSeconds') THEN (o.data->>'heartbeatSeconds')::int ELSE job.heartbeat_seconds END,
+          group_id = CASE WHEN jsonb_exists(o.data, 'groupId') THEN o.data->>'groupId' ELSE job.group_id END,
+          group_tier = CASE WHEN jsonb_exists(o.data, 'groupTier') THEN o.data->>'groupTier' ELSE job.group_tier END
       FROM o
       -- Re-check state < active on the locked row, not just in the unlocked target CTE. Under
       -- READ COMMITTED a concurrent fetchNextJob can activate a candidate between target selection
@@ -3016,4 +2748,233 @@ export function getBamEntries (schema: string) {
     FROM ${schema}.bam
     ORDER BY version, created_on
   `
+}
+
+// --- pg-boss expected schema shape (drift detection) ---
+//
+// The pg-boss-specific side of drift detection: the expected index/function/column/constraint/enum
+// shape, plus the catalog probes that read partitioning topology from the live database. These feed
+// the generic engine in drifter.ts (which knows nothing about pg-boss). Kept here because they are
+// built directly from the DDL generators above.
+
+interface QueuePartition {
+  table: string
+  policy?: string | null
+}
+
+// job_iN partial indexes that gate on a queue policy: a per-queue partition table (partition:true)
+// only receives the index for its own policy (see create_queue, createQueueFunction). The shared
+// job_common table and a non-partitioned job table carry all of them at once. Keep in sync with the
+// createIndexJobPolicy* builders and the ELSIF ladder in createQueueFunction.
+const POLICY_JOB_INDEXES: Record<number, string> = {
+  1: QUEUE_POLICIES.short,
+  2: QUEUE_POLICIES.singleton,
+  3: QUEUE_POLICIES.stately,
+  6: QUEUE_POLICIES.exclusive,
+  8: QUEUE_POLICIES.key_strict_fifo
+}
+// job_iN indexes with no policy gate — created on every job table regardless of policy
+// (throttle i4, fetch i5, group-concurrency i7, blocking i9).
+const BASE_JOB_INDEXES = [4, 5, 7, 9]
+const ALL_JOB_INDEXES = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+// Static managed indexes that always exist, one per non-job managed table. `ddl` takes the schema so
+// the same builder yields both the schema-agnostic form (for the key/predicate diff) and the real
+// schema-qualified `CREATE INDEX` (for the report's `definition`). These generators already emit the
+// final index name and table, so no partition rewrite is needed.
+const STATIC_MANAGED_INDEXES: ReadonlyArray<{ name: string, table: string, ddl: (schema: string) => string }> = [
+  { name: 'warning_i1', table: 'warning', ddl: createIndexWarning },
+  { name: 'queue_stats_i1', table: 'queue_stats', ddl: (schema: string) => createIndexQueueStats(schema) },
+  { name: 'job_dep_parent_idx', table: 'job_dependency', ddl: createIndexJobDependencyParent }
+]
+
+// The CREATE INDEX DDL builder for each job_iN index, by index number — used to derive the expected
+// key-column list and predicate. job_table_format rewrites only the table and index name for
+// partitions, never the key columns or predicate, so both are a function of the index number alone.
+// (The referenced builders are hoisted function declarations, so this map is safe to initialise here.)
+const JOB_INDEX_DDL: Record<number, (schema: string) => string> = {
+  1: createIndexJobPolicyShort,
+  2: createIndexJobPolicySingleton,
+  3: createIndexJobPolicyStately,
+  4: createIndexJobThrottle,
+  5: createIndexJobFetch,
+  6: createIndexJobPolicyExclusive,
+  7: createIndexJobGroupConcurrency,
+  8: createIndexJobPolicyKeyStrictFifo,
+  9: createIndexJobBlocking
+}
+function jobIndexDdl (n: number, schema = 'x'): string {
+  return JOB_INDEX_DDL[n](schema)
+}
+
+// Rewrites a generic job_iN CREATE INDEX (built against the `job` table) into the physical statement
+// for a specific job table — the shared `job_common`, a per-queue partition, or `job` itself when
+// partitioning is off. This is the TS mirror of the job_table_format() SQL function: `.job` becomes
+// `.<table>` and `job_iN` becomes `<table>_iN`. The `\b`/word-boundary anchors leave `.job_common`,
+// `.job_dependency`, and `job_common` untouched. A no-op when table is 'job'.
+function physicalJobIndexDdl (ddl: string, table: string): string {
+  return ddl
+    .replace(/\.job\b/g, '.' + table)
+    .replace(/\bjob_i(\d+)/g, table + '_i$1')
+}
+
+// Probe for the default partition; its presence means the partitioned architecture is in use, so
+// drift detection reads it from the live database rather than trusting a boss config flag.
+export function jobCommonExists (schema: string) {
+  return `SELECT to_regclass('${schema}.${COMMON_JOB_TABLE}') as name`
+}
+
+// Per-queue partition tables and their policy, so the expected index set can be computed per table.
+export function getManagedQueuePartitions (schema: string) {
+  return `SELECT table_name as "table", policy FROM ${schema}.queue WHERE partition = true`
+}
+
+// The CREATE INDEX command text of every BAM row not yet completed — used to tell a genuinely-missing
+// index apart from one an async build is still working on (or retrying after a failure).
+export function getIncompleteBamCommands (schema: string) {
+  return `SELECT command FROM ${schema}.bam WHERE status <> 'completed'`
+}
+
+// The columns pg-boss expects on each managed table. Fixed tables carry a static column set plus their
+// column defaults (for the default-drift check); the job table's columns (shared by job_common and
+// every per-queue partition in partitioned mode) are parsed from the job DDL and carry NO defaults —
+// their FKs are profile-dependent and keep_until's interval default is not text-comparable, so those
+// tables are name-only. queue_stats drops nothing between modes, only its partitioning, so the column
+// set is mode-independent. A table with no live columns is skipped by the diff, so listing a table that
+// does not exist yet (e.g. bam on a pre-v27 schema) is harmless.
+export function expectedManagedColumns (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): ExpectedColumns[] {
+  // Fixed tables carry defaults + types so column defaults, data types, and nullability are diffed too;
+  // the job/partition tables get a name-only entry (their defaults/types are profile-dependent).
+  const fixed = (table: string, ddl: string): ExpectedColumns =>
+    ({ table, columns: tableColumns(ddl), defaults: tableColumnDefaults(ddl), types: tableColumnTypes(ddl) })
+
+  const out: ExpectedColumns[] = [
+    fixed('version', createTableVersion(schema)),
+    fixed('queue', createTableQueue(schema)),
+    fixed('schedule', createTableSchedule(schema)),
+    fixed('subscription', createTableSubscription(schema)),
+    fixed('bam', createTableBam(schema)),
+    fixed('warning', createTableWarning(schema)),
+    fixed('queue_stats', createTableQueueStats(schema, !partitioned)),
+    fixed('job_dependency', createTableJobDependency(schema))
+  ]
+
+  const jobColumns = tableColumns(createTableJob(schema))
+  out.push({ table: 'job', columns: jobColumns })
+  if (partitioned) {
+    out.push({ table: COMMON_JOB_TABLE, columns: jobColumns })
+    for (const p of partitions) out.push({ table: p.table, columns: jobColumns })
+  }
+
+  return out
+}
+
+// The tables pg-boss expects to exist. The fixed set is always present; the partitioned architecture
+// adds job_common and every per-queue partition table (the `job` parent table exists in both modes).
+export function expectedManagedTables (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): string[] {
+  const tables = ['version', 'queue', 'schedule', 'subscription', 'bam', 'warning', 'queue_stats', 'job_dependency', 'job']
+  if (partitioned) {
+    tables.push(COMMON_JOB_TABLE)
+    for (const p of partitions) tables.push(p.table)
+  }
+  return tables
+}
+
+// The constraints pg-boss expects on each FIXED managed table (job/job_common/partitions are excluded:
+// their FKs are profile-dependent DEFERRABLE). These literals were captured from live
+// pg_get_constraintdef on a fresh schema, so they compare equal after normalizeConstraintDef — the
+// fresh-install integration test verifies this.
+export function expectedManagedConstraints (schema: string, partitioned: boolean): ExpectedConstraints[] {
+  return [
+    { table: 'version', constraints: ['PRIMARY KEY (version)'] },
+    { table: 'queue', constraints: ['PRIMARY KEY (name)', `FOREIGN KEY (dead_letter) REFERENCES ${schema}.queue(name)`, 'CHECK ((dead_letter IS DISTINCT FROM name))'] },
+    { table: 'schedule', constraints: ['PRIMARY KEY (name, key)', `FOREIGN KEY (name) REFERENCES ${schema}.queue(name) ON DELETE CASCADE`] },
+    { table: 'subscription', constraints: ['PRIMARY KEY (event, name)', `FOREIGN KEY (name) REFERENCES ${schema}.queue(name) ON DELETE CASCADE`] },
+    { table: 'bam', constraints: ['PRIMARY KEY (id)'] },
+    { table: 'warning', constraints: ['PRIMARY KEY (id)'] },
+    { table: 'queue_stats', constraints: [partitioned ? 'PRIMARY KEY (id, captured_on)' : 'PRIMARY KEY (id)'] },
+    { table: 'job_dependency', constraints: ['PRIMARY KEY (child_name, child_id, parent_name, parent_id)'] }
+  ]
+}
+
+// The job_state values in declaration order — must stay in sync with createEnumJobState. The base type
+// is numeric, so first values are less than last values and state comparisons depend on this order.
+export const EXPECTED_JOB_STATES: readonly string[] = [
+  JOB_STATES.created,
+  JOB_STATES.retry,
+  JOB_STATES.active,
+  JOB_STATES.completed,
+  JOB_STATES.cancelled,
+  JOB_STATES.failed
+]
+
+// The functions pg-boss expects to exist in `schema`. The partitioned architecture adds the three
+// job_table_* helpers and uses the partition-aware create_queue/delete_queue bodies; non-partitioned
+// mode creates neither the helpers nor the partition branches (see create()). Each entry carries the
+// whitespace-normalised body used for the diff and the full statement for remediation.
+export function expectedManagedFunctions (schema: string, partitioned: boolean): ManagedFunction[] {
+  const defs = partitioned
+    ? [
+        jobTableFormatFunction(schema),
+        jobTableRunFunction(schema),
+        jobTableRunAsyncFunction(schema),
+        createQueueFunction(schema, false),
+        deleteQueueFunction(schema, false)
+      ]
+    : [
+        createQueueFunction(schema, true),
+        deleteQueueFunction(schema, true)
+      ]
+
+  return defs.map(def => ({
+    name: functionName(def),
+    expectedBody: normalizeFunctionBody(extractFunctionBody(def)),
+    definition: def.replace(/\s+/g, ' ').trim()
+  }))
+}
+
+// Computes the set of indexes pg-boss expects to exist in `schema`. `partitioned` reflects the live
+// database (job_common present ⇒ partitioned architecture), so this needs no boss config. In
+// partitioned mode, job_common carries the full job_iN set and each per-queue partition carries the
+// base set plus its policy index; non-partitioned mode puts the full set directly on `job`.
+// noCoveringIndexes only changes index *definitions*, not names, so it does not affect presence.
+// Each entry's `definition` is the full schema-qualified CREATE INDEX statement, ready to re-run.
+export function expectedManagedIndexes (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): ManagedIndex[] {
+  // genericDdl (schema 'x', `job` table) drives the key/predicate diff; definition is the real
+  // schema-qualified, physically-named statement surfaced for remediation.
+  const entry = (name: string, table: string, genericDdl: string, definition: string): ManagedIndex =>
+    ({ name, table, keys: indexKeysRaw(genericDdl), predicate: indexPredicateRaw(genericDdl), definition })
+  const out: ManagedIndex[] = STATIC_MANAGED_INDEXES.map(i => entry(i.name, i.table, i.ddl('x'), i.ddl(schema)))
+  const jobIndex = (name: string, table: string, n: number): ManagedIndex =>
+    entry(name, table, jobIndexDdl(n), physicalJobIndexDdl(jobIndexDdl(n, schema), table))
+
+  if (!partitioned) {
+    for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`job_i${n}`, 'job', n))
+    return out
+  }
+
+  for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`${COMMON_JOB_TABLE}_i${n}`, COMMON_JOB_TABLE, n))
+
+  for (const p of partitions) {
+    for (const n of BASE_JOB_INDEXES) out.push(jobIndex(`${p.table}_i${n}`, p.table, n))
+    for (const [n, policy] of Object.entries(POLICY_JOB_INDEXES)) {
+      if (p.policy === policy) out.push(jobIndex(`${p.table}_i${Number(n)}`, p.table, Number(n)))
+    }
+  }
+
+  return out
+}
+
+// pg-boss names its own indexes `<table>_iN` (or the three static names). A catalog index matching
+// that convention but not in the expected set is drift (e.g. a stale policy index left after a
+// queue's policy changed); anything else is a user's own index and is ignored.
+const MANAGED_INDEX_NAME = /_i\d+$/
+export function isManagedIndexName (name: string): boolean {
+  return MANAGED_INDEX_NAME.test(name) || STATIC_MANAGED_INDEXES.some(i => i.name === name)
+}
+
+// Extracts the index name a BAM command builds, so an incomplete build can be matched to a missing
+// index. Mirrors the CREATE INDEX shapes bamHealDrop recognises.
+export function bamCommandIndexName (command: string): string | null {
+  const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([\w$]+)"?/i)
+  return match ? match[1] : null
 }

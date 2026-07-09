@@ -461,7 +461,7 @@ describePglite('cli', function () {
         await createSchema()
 
         const { stdout, code } = runCli(['doctor', '--connection-string', connectionString, '--schema', schema])
-        expect(stdout).toContain('No index drift detected')
+        expect(stdout).toContain('No drift detected')
         expect(code).toBe(0)
       })
 

@@ -5,6 +5,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import Db from './db.ts'
 import * as plans from './plans.ts'
+import * as drifter from './drifter.ts'
 import * as migrationStore from './migrationStore.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import type * as types from './types.ts'
@@ -393,7 +394,7 @@ async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> 
     const partitions = partitioned
       ? (await db.executeSql(plans.getManagedQueuePartitions(schema))).rows
       : []
-    const live = (await db.executeSql(plans.getSchemaIndexes(schema))).rows
+    const live = (await db.executeSql(drifter.getSchemaIndexes(schema))).rows
 
     let bamCommands: string[] = []
     try {
@@ -402,43 +403,144 @@ async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> 
       // pre-v27 schema without a bam table
     }
 
-    const expected = plans.expectedManagedIndexes(partitioned, partitions)
-    const report = plans.computeSchemaDrift(expected, live, bamCommands)
-
-    const printSection = (label: string, items: { name: string, table: string }[]) => {
-      if (!items.length) return
-      console.log(`\n${label} (${items.length}):`)
-      for (const i of items) {
-        console.log(`  ${i.table}.${i.name}`)
-      }
+    // Function-body / enum drift is best-effort (pg_get_functiondef is unsupported on some backends).
+    let liveFunctions: Array<{ name: string, def: string }> = []
+    try {
+      liveFunctions = (await db.executeSql(drifter.getSchemaFunctions(schema))).rows.map((r: { name: string, def: string }) => ({ name: r.name, def: r.def }))
+    } catch {
+      // backend without pg_get_functiondef
     }
 
+    let enumLabels: string[] = []
+    try {
+      enumLabels = (await db.executeSql(drifter.getEnumDefinition(schema))).rows.map((r: { label: string }) => r.label)
+    } catch {
+      // backend without enums
+    }
+
+    let liveColumns: Array<{ table: string, column: string, default?: string | null, type?: string, notNull?: boolean }> = []
+    try {
+      liveColumns = (await db.executeSql(drifter.getSchemaColumns(schema))).rows.map((r: { table: string, column: string, default: string | null, type: string, notNull: boolean }) =>
+        ({ table: r.table, column: r.column, default: r.default, type: r.type, notNull: r.notNull }))
+    } catch {
+      // catalog unavailable
+    }
+
+    let liveConstraints: Array<{ table: string, def: string }> = []
+    try {
+      liveConstraints = (await db.executeSql(drifter.getSchemaConstraints(schema))).rows.map((r: { table: string, def: string }) => ({ table: r.table, def: r.def }))
+    } catch {
+      // catalog unavailable
+    }
+
+    const building = new Set(bamCommands.map(plans.bamCommandIndexName).filter((n): n is string => n !== null))
+
+    const expected = plans.expectedManagedIndexes(schema, partitioned, partitions)
+    const report = drifter.computeSchemaDrift(expected, live, {
+      building,
+      isManaged: plans.isManagedIndexName,
+      tables: { expected: plans.expectedManagedTables(schema, partitioned, partitions), live: [...new Set(liveColumns.map(c => c.table))] },
+      functions: { expected: plans.expectedManagedFunctions(schema, partitioned), live: liveFunctions },
+      columns: { expected: plans.expectedManagedColumns(schema, partitioned, partitions), live: liveColumns },
+      constraints: { expected: plans.expectedManagedConstraints(schema, partitioned), live: liveConstraints },
+      enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: enumLabels }
+    })
+
     if (report.building.length) {
-      printSection('Building (async index build in progress — not yet drift)', report.building)
+      console.log(`\nBuilding (async index build in progress — not yet drift) (${report.building.length}):`)
+      for (const i of report.building) console.log(`  ${i.table}.${i.name}`)
     }
 
     if (report.ok) {
-      console.log('\n✓ No index drift detected')
+      console.log('\n✓ No drift detected')
       return
     }
 
-    printSection('MISSING (expected but absent)', report.missing)
-    printSection('INVALID (present but marked invalid — needs rebuild)', report.invalid)
-    printSection('UNEXPECTED (pg-boss-named index not in the expected set)', report.unexpected)
+    if (report.missingTables.length) {
+      console.log(`\nMISSING TABLES (expected but absent) (${report.missingTables.length}):`)
+      for (const t of report.missingTables) console.log(`  ${t}`)
+    }
+
+    // Each drifted index is printed with the expected (correct) definition and, where one exists, the
+    // actual definition beneath it, for a direct side-by-side comparison and copy-paste remediation.
+    if (report.missing.length) {
+      console.log(`\nMISSING (expected but absent) (${report.missing.length}):`)
+      for (const i of report.missing) {
+        console.log(`  ${i.table}.${i.name}`)
+        if (i.definition) console.log(`    expected: ${i.definition}`)
+      }
+    }
+
+    if (report.invalid.length) {
+      // The definition is correct — the index is just invalid (interrupted build) — so show the DDL to
+      // drop and rebuild it, not an expected-vs-actual comparison (they would be identical).
+      console.log(`\nINVALID (present but marked invalid — drop and rebuild) (${report.invalid.length}):`)
+      for (const i of report.invalid) {
+        console.log(`  ${i.table}.${i.name}`)
+        if (i.definition) console.log(`    rebuild: ${i.definition}`)
+      }
+    }
+
+    if (report.unexpected.length) {
+      console.log(`\nUNEXPECTED (pg-boss-named index not in the expected set) (${report.unexpected.length}):`)
+      for (const i of report.unexpected) console.log(`  ${i.table}.${i.name}`)
+    }
+
     if (report.mismatched.length) {
       console.log(`\nMISMATCHED (definition differs) (${report.mismatched.length}):`)
       for (const m of report.mismatched) {
         console.log(`  ${m.table}.${m.name} [${m.differs.join(', ')}]`)
-        if (m.differs.includes('keys')) {
-          console.log(`    keys expected: (${m.expectedKeys})`)
-          console.log(`    keys actual:   (${m.actualKeys})`)
-        }
-        if (m.differs.includes('predicate')) {
-          console.log(`    where expected: ${m.expectedPredicate || '(none)'}`)
-          console.log(`    where actual:   ${m.actualPredicate || '(none)'}`)
-        }
+        if (m.definition) console.log(`    expected: ${m.definition}`)
+        console.log(`    actual:   ${m.actualDefinition}`)
       }
     }
+
+    if (report.missingFunctions.length) {
+      console.log(`\nMISSING FUNCTIONS (expected but absent) (${report.missingFunctions.length}):`)
+      for (const f of report.missingFunctions) {
+        console.log(`  ${f.name}`)
+        console.log(`    expected: ${f.definition}`)
+      }
+    }
+
+    if (report.mismatchedFunctions.length) {
+      console.log(`\nMISMATCHED FUNCTIONS (body differs) (${report.mismatchedFunctions.length}):`)
+      for (const f of report.mismatchedFunctions) {
+        console.log(`  ${f.name}`)
+        console.log(`    expected: ${f.definition}`)
+        console.log(`    actual:   ${f.actualDefinition}`)
+      }
+    }
+
+    if (report.columnDrift.length) {
+      console.log(`\nCOLUMN DRIFT (missing/unexpected columns, or default/type/nullability drift) (${report.columnDrift.length}):`)
+      for (const c of report.columnDrift) {
+        console.log(`  ${c.table}`)
+        if (c.missingColumns.length) console.log(`    missing:    ${c.missingColumns.join(', ')}`)
+        if (c.unexpectedColumns.length) console.log(`    unexpected: ${c.unexpectedColumns.join(', ')}`)
+        for (const d of c.defaultMismatches) console.log(`    default ${d.column}: expected ${d.expected}, actual ${d.actual}`)
+        for (const d of c.typeMismatches) console.log(`    type ${d.column}: expected ${d.expected}, actual ${d.actual}`)
+        for (const d of c.nullabilityMismatches) console.log(`    nullability ${d.column}: expected ${d.expected ? 'NOT NULL' : 'nullable'}, actual ${d.actual ? 'NOT NULL' : 'nullable'}`)
+      }
+    }
+
+    if (report.constraintDrift.length) {
+      console.log(`\nCONSTRAINT DRIFT (missing or unexpected constraints) (${report.constraintDrift.length}):`)
+      for (const c of report.constraintDrift) {
+        console.log(`  ${c.table}`)
+        if (c.missingConstraints.length) for (const d of c.missingConstraints) console.log(`    missing:    ${d}`)
+        if (c.unexpectedConstraints.length) for (const d of c.unexpectedConstraints) console.log(`    unexpected: ${d}`)
+      }
+    }
+
+    if (report.enumDrift) {
+      const e = report.enumDrift
+      console.log('\nENUM DRIFT (value set/order differs):')
+      console.log(`  ${e.name}`)
+      console.log(`    expected: ${e.expectedValues.join(', ')}`)
+      console.log(`    actual:   ${e.actualValues.join(', ')}`)
+    }
+
     console.log('\n✗ Schema drift detected')
     process.exitCode = 1
   } finally {

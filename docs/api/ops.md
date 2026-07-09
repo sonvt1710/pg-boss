@@ -142,15 +142,18 @@ Array of objects with the following properties:
 
 ### `detectSchemaDrift()`
 
-Compares the managed indexes pg-boss expects against what actually exists in the database and reports any drift. Use it to catch indexes that were dropped, left `INVALID` by an interrupted build, altered, or otherwise diverged from the version pg-boss installed — for example after a manual schema change or a failed migration.
+Compares the managed tables, indexes, functions, table columns (name, default, type, and nullability), table constraints, and the `job_state` enum pg-boss expects against what actually exists in the database and reports any drift. Use it to catch tables that were dropped; indexes that were dropped, left `INVALID` by an interrupted build, or altered; functions whose body was changed (e.g. a manual `CREATE OR REPLACE`); table columns that were added or dropped; column defaults, data types, or NOT NULL flags that were changed; primary-key/foreign-key/check constraints that were dropped or added; and enum values that were added or reordered — anything that diverged from the version pg-boss installed, for example after a manual schema change or a failed migration.
 
-The scan is catalog-only (no locks, no table scans) and covers presence, key-column order, and partial-index predicates. Partitioned vs. non-partitioned and per-queue policy indexes are read from the live database, so conditional indexes are handled. Index predicates that are not simple boolean conjunctions and non-index objects (tables, columns, constraints, functions) are out of scope.
+The scan is catalog-only (no locks, no table scans) and includes partial-index predicates. Partitioned vs. non-partitioned and per-queue policy indexes are read from the live database, since partitioned tables have conditional indexes. Table presence and column *name* drift (a missing or unexpected column) cover job_common and every per-queue partition alongside the fixed tables. Column *default*, *type*, and *nullability* drift and *constraint* drift are limited to the fixed tables (version, queue, schedule, subscription, bam, warning, queue_stats, job_dependency) — the job/job_common/partition tables are excluded because their foreign keys are `DEFERRABLE` under some backend profiles and their `keep_until` default renders as a non-comparable interval literal, both of which would false-positive. Function-body, constraint, and enum checks are best-effort: on backends without `pg_get_functiondef`/`pg_get_constraintdef` (e.g. CockroachDB) they are skipped rather than reported as drift. On CockroachDB the type/default/constraint checks are skipped entirely — its `INT8` typing, default rendering, and constraint definitions diverge from standard Postgres — leaving the presence checks (tables, indexes, column names, functions, enum) active.
+
+For example, when an index has been altered so its definition no longer matches — here `job_common_i9`'s predicate was changed from `state = 'completed'` to `state = 'active'` — it is flagged under `mismatched`, with the expected `definition` and the current `actualDefinition` side by side:
 
 ```js
 const report = await boss.detectSchemaDrift()
 // {
 //   ok: false,
-//   missing: [ { name: 'job_common_i5', table: 'job_common' } ],
+//   missingTables: [],        // e.g. ['warning'] — an expected managed table is absent
+//   missing: [],
 //   building: [],
 //   invalid: [],
 //   unexpected: [],
@@ -159,14 +162,34 @@ const report = await boss.detectSchemaDrift()
 //       name: 'job_common_i9',
 //       table: 'job_common',
 //       differs: ['predicate'],
-//       expectedKeys: 'name,id',
-//       actualKeys: 'name,id',
-//       expectedPredicate: "blockingandstate='completed'",
-//       actualPredicate: "blockingandstate='active'"
+//       // the correct statement vs. what is actually in the catalog
+//       definition:       "CREATE INDEX job_common_i9 ON pgboss.job_common (name, id) WHERE blocking AND state = 'completed'",
+//       actualDefinition: "CREATE INDEX job_common_i9 ON pgboss.job_common (name, id) WHERE blocking AND (state = 'active')",
+//       expectedPredicate: "blocking AND state = 'completed'",
+//       actualPredicate: "blocking AND (state = 'active')",
+//       expectedKeys: 'name, id',
+//       actualKeys: 'name, id'
 //     }
-//   ]
+//   ],
+//   missingFunctions: [],
+//   mismatchedFunctions: [],  // e.g. { name: 'create_queue', expectedBody, actualBody, definition, actualDefinition }
+//   columnDrift: [],          // e.g. { table: 'queue', missingColumns: [], unexpectedColumns: ['legacy_flag'],
+//                             //        defaultMismatches: [{ column: 'notify', expected: 'false', actual: 'true' }],
+//                             //        typeMismatches: [{ column: 'retry_limit', expected: 'integer', actual: 'bigint' }],
+//                             //        nullabilityMismatches: [{ column: 'policy', expected: true, actual: false }] }
+//   constraintDrift: [],      // e.g. { table: 'queue', missingConstraints: ['CHECK ((dead_letter IS DISTINCT FROM name))'],
+//                             //        unexpectedConstraints: [] }
+//   enumDrift: null           // or { name: 'job_state', expectedValues: [...], actualValues: [...] }
 // }
 ```
+
+Every drifted index entry carries `definition` — the full, schema-qualified `CREATE INDEX` statement pg-boss expects — so you can copy it to recreate the index. `mismatched` entries also carry `actualDefinition` (from `pg_get_indexdef`) for a direct side-by-side comparison. `invalid` and `missing` entries carry only `definition`: an invalid index already *has* the correct definition (an interrupted build, not a wrong shape), and a missing one has no catalog entry to compare against, so there is nothing meaningful to place beside `definition`.
+
+Function drift is reported the same way: `missingFunctions` holds expected functions with no catalog entry, and `mismatchedFunctions` holds present functions whose body differs, each with the expected `definition` and the current `actualDefinition` (from `pg_get_functiondef`). Because Postgres stores a function body verbatim, the comparison is on the body text (whitespace-normalized), so re-indentation alone is never reported as drift. `enumDrift` is `null` when the `job_state` values and their order match, or an object with `expectedValues`/`actualValues` when they diverge (order is significant — the enum's numeric base type makes it load-bearing for state comparisons).
+
+Table presence rides the same report: `missingTables` lists managed tables (fixed tables, plus `job`/`job_common`/partitions in partitioned mode) that the catalog does not have — a dropped table shows up here rather than as a flood of missing columns.
+
+Column-default, type, nullability, and constraint drift ride the same report too. A `columnDrift` entry adds three per-column arrays for the fixed tables: `defaultMismatches` (`{ column, expected, actual }` — compared on a normalized form, so a cast or reformat pg adds like `'pending'::text` vs `'pending'` is not flagged), `typeMismatches` (`{ column, expected, actual }`, where the type is the canonical `format_type` form so `int` vs `integer` is not flagged but `integer` vs `bigint` is), and `nullabilityMismatches` (`{ column, expected, actual }` of booleans — a dropped or added NOT NULL, primary-key columns counted as NOT NULL). `constraintDrift` lists fixed tables whose constraint set differs: `missingConstraints` are the expected `pg_get_constraintdef` statements absent from the catalog, `unexpectedConstraints` the extra ones present. Comparison is a normalized set of definition strings (lower-cased, casts/quotes/whitespace folded), so only a genuinely added or dropped constraint is reported.
 
 **Returns**
 
@@ -174,13 +197,39 @@ An object with the following properties:
 
 | Property | Type | Description |
 | --- | --- | --- |
-| `ok` | boolean | `true` when nothing is missing, invalid, unexpected, or mismatched |
+| `ok` | boolean | `true` when nothing differs across tables, indexes, functions, columns, defaults, types, constraints, or enum |
+| `missingTables` | array | Expected managed tables with no matching catalog table |
 | `missing` | array | Expected indexes with no matching catalog entry (excludes any a BAM row is still building) |
 | `building` | array | Expected indexes still being built by a pending/in&#95;progress/failed BAM row — not yet drift |
 | `invalid` | array | Present indexes marked `INVALID` by an interrupted `CREATE INDEX CONCURRENTLY` (each has a `building` flag) |
 | `unexpected` | array | Present indexes matching pg-boss's naming that the expected set does not account for (e.g. a stale policy index) |
 | `mismatched` | array | Present indexes whose key columns/order or predicate differ from the expected definition |
+| `missingFunctions` | array | Expected managed functions with no catalog entry |
+| `mismatchedFunctions` | array | Present managed functions whose body differs from the expected definition |
+| `columnDrift` | array | Managed tables with column drift (each has `table`, `missingColumns`, `unexpectedColumns`, `defaultMismatches`, `typeMismatches`, and `nullabilityMismatches`); only tables that differ are listed. Default/type/nullability checks cover the fixed tables only |
+| `constraintDrift` | array | Fixed tables whose constraint set differs (each has `table`, `missingConstraints`, `unexpectedConstraints`); only tables that differ are listed |
+| `enumDrift` | object \| null | Set when the `job_state` value set or order differs; `null` when it matches |
 
-Each entry carries at least `name` and `table`. `mismatched` entries also include `expectedKeys`/`actualKeys`, `expectedPredicate`/`actualPredicate`, and `differs` (`['keys']`, `['predicate']`, or both). Key and predicate strings are normalized for comparison, so they will not match the raw SQL character-for-character.
+Each entry carries at least `name`, `table`, the readable `keys` and `predicate` it was matched against, and `definition` (the full expected `CREATE INDEX`). `invalid` entries add a `building` flag. `mismatched` entries add `actualDefinition` (the current statement from `pg_get_indexdef`), `expectedKeys`/`actualKeys`, `expectedPredicate`/`actualPredicate`, and `differs` (`['keys']`, `['predicate']`, or both). The `actual*` values come from `pg_get_indexdef`, lightly tidied for readability (the default `USING btree` clause, the redundant outer parentheses pg wraps the predicate in, and the type casts pg adds to every literal — e.g. `'active'::pgboss.job_state` reads as `'active'` — are all removed); inner grouping is left as-is. Comparison itself is done on a normalized form internally (order-significant, but insensitive to casing, casts, parentheses, and whitespace), so a difference in those alone is never reported as drift.
 
 The [`doctor`](../cli#doctor) CLI command runs this same check without writing any application code.
+
+**Remediation**
+
+`detectSchemaDrift()` only reports — it never modifies the schema. Note that `start()` and `migrate` rebuild indexes *only* as part of a version change, so on a schema that is already at the latest version they will not repair drift; the fixes below are manual. Run `DROP`/`CREATE INDEX` with `CONCURRENTLY` on a live database so job processing is not blocked.
+
+| Category | What it means | How to fix |
+| --- | --- | --- |
+| `missingTables` | An expected managed table is absent | Restore it — usually by running the schema migration for the version that adds it (or restore from backup). |
+| `building` | An async index build is still in progress | No action — re-check later. `getBamStatus()` shows build progress. |
+| `invalid` | An interrupted build left the index `INVALID` (the definition is correct) | If `building` is `true` (or `getBamStatus()` shows a `pending`/`failed` row for it), it heals on the next `start()`. Otherwise `DROP INDEX CONCURRENTLY <schema>.<name>` and re-run the entry's `definition`. |
+| `missing` | An expected index is absent | Run the entry's `definition` — a restart alone will not, since the schema is already current. |
+| `mismatched` | A present index diverges from the expected `keys` or `predicate` | Drop the divergent index (`actualDefinition` shows it) and run the entry's `definition` to recreate it. |
+| `unexpected` | A pg-boss-named index the current schema does not expect (typically stale after a queue's policy changed) | Safe to `DROP INDEX CONCURRENTLY` once you confirm it is not one you added yourself. |
+| `missingFunctions` | An expected managed function is absent | Run the entry's `definition` (`CREATE FUNCTION …`) to recreate it. |
+| `mismatchedFunctions` | A present function's body was altered | Re-run the entry's `definition` as `CREATE OR REPLACE FUNCTION …` to restore it. |
+| `columnDrift` | A managed table has a missing/unexpected column, or a changed default, type, or nullability | Restore a `missingColumns` entry with `ALTER TABLE … ADD COLUMN`; investigate an `unexpectedColumns` entry before dropping it (it may be one you added); fix a `defaultMismatches` entry with `ALTER TABLE … ALTER COLUMN … SET DEFAULT <expected>`, a `typeMismatches` entry with `ALTER COLUMN … TYPE <expected>`, and a `nullabilityMismatches` entry with `ALTER COLUMN … SET/DROP NOT NULL`. |
+| `constraintDrift` | A fixed table's constraint set differs | Recreate a `missingConstraints` entry with `ALTER TABLE … ADD <constraint def>`; investigate an `unexpectedConstraints` entry before `DROP CONSTRAINT` (it may be one you added). |
+| `enumDrift` | The `job_state` value set or order was changed | Reverting a manual `ALTER TYPE` is not straightforward; recreating the type is risky on a live schema. Restore from backup or open an issue if you did not change it. |
+
+Each `invalid`, `missing`, and `mismatched` index entry includes a ready-to-run `definition` (the complete `CREATE INDEX`, `UNIQUE` and all). When applying it to a live table, insert `CONCURRENTLY` (`CREATE INDEX CONCURRENTLY …`) so it does not block job processing. `missingFunctions`/`mismatchedFunctions` entries carry a `definition` too. `pg-boss doctor` prints the same `definition` (and `actualDefinition`) beneath each drifted entry.
