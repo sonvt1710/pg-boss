@@ -57,7 +57,7 @@
     "tsc": "tsc --noEmit",
     "cli": "node ./dist/cli.js",
     "gen:manifest": "tsx scripts/gen-manifest.ts",
-    "gen:manifest:check": "tsx scripts/gen-manifest.ts && git diff --exit-code src/schema-manifest.json",
+    "gen:manifest:check": "tsx scripts/gen-manifest.ts --check",
     "console": "tsx scripts/console.js",
     "seed": "tsx scripts/seed-queue-stats.js",
     "readme": "node ./examples/readme.js",

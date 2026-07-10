@@ -11,7 +11,7 @@
 // DDL change that forgets to regenerate is a red build rather than silent drift.
 
 import { PGlite } from '@electric-sql/pglite'
-import { writeFileSync } from 'node:fs'
+import { writeFileSync, readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as plans from '../src/plans.ts'
@@ -89,5 +89,24 @@ const manifest = {
 }
 
 const outPath = resolve(dirname(fileURLToPath(import.meta.url)), '../src/schema-manifest.json')
-writeFileSync(outPath, JSON.stringify(manifest, null, 2) + '\n')
-console.log(`wrote ${outPath} (schema v${version})`)
+const serialized = JSON.stringify(manifest, null, 2) + '\n'
+
+// `--check` (used by CI / pretest) verifies the committed manifest matches what the current DDL would
+// produce, without touching the file or needing a git working tree. A mismatch means someone changed
+// the schema DDL without regenerating — fail with a clear instruction.
+if (process.argv.includes('--check')) {
+  let existing: string | null = null
+  try {
+    existing = readFileSync(outPath, 'utf8')
+  } catch {
+    existing = null
+  }
+  if (existing !== serialized) {
+    console.error(`${outPath} is out of date. Run \`npm run gen:manifest\` and commit the result.`)
+    process.exit(1)
+  }
+  console.log(`schema manifest is up to date (schema v${version})`)
+} else {
+  writeFileSync(outPath, serialized)
+  console.log(`wrote ${outPath} (schema v${version})`)
+}
