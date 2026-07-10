@@ -1864,7 +1864,7 @@ function failJobsBody (schema: string, table: string, where: string, output: str
              WHEN NOT retry_backoff THEN now() + retry_delay * interval '1'
              ELSE now() + LEAST(
                retry_delay_max,
-               retry_delay * (
+               GREATEST(retry_delay, 1) * (
                 2 ^ LEAST(16, retry_count + 1) / 2 +
                 2 ^ LEAST(16, retry_count + 1) / 2 * random()
                )

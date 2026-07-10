@@ -73,6 +73,32 @@ describe('retries', function () {
     expect(processCount < retryLimit).toBeTruthy()
   })
 
+  it('should apply nonzero backoff when retryBackoff is set but retryDelay is not (#839)', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    // retryBackoff enabled, retryDelay left unset (defaults to 0). Before the fix the
+    // backoff formula multiplied by 0, so the retry fired immediately.
+    const jobId = await ctx.boss.send(ctx.schema, null, { retryLimit: 1, retryBackoff: true })
+    assertTruthy(jobId)
+
+    await ctx.boss.fetch(ctx.schema)
+
+    const t0 = Date.now()
+    await ctx.boss.fail(ctx.schema, jobId)
+
+    const job = await ctx.boss.getJobById(ctx.schema, jobId)
+    assertTruthy(job)
+    assertTruthy(job.startAfter)
+
+    const backoffSeconds = (new Date(job.startAfter).getTime() - t0) / 1000
+    // First retry with retry_delay floored to 1 lands ~1-2s out; assert it is clearly nonzero.
+    expect(backoffSeconds).toBeGreaterThan(0.5)
+
+    // job should not be immediately fetchable
+    const [immediate] = await ctx.boss.fetch(ctx.schema)
+    expect(immediate).toBeFalsy()
+  })
+
   it('should limit retry delay with exponential backoff', { timeout: 15000 }, async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 

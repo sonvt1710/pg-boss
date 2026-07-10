@@ -1559,7 +1559,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
           startAfter = new Date(Date.now() + retryDelay * 1000)
         } else {
           const exp = Math.min(16, retryCount + 1)
-          const delay = retryDelay * (Math.pow(2, exp) / 2 + Math.pow(2, exp) / 2 * Math.random())
+          const delay = Math.max(retryDelay, 1) * (Math.pow(2, exp) / 2 + Math.pow(2, exp) / 2 * Math.random())
           // Match the canonical failJobs() SQL: LEAST(retry_delay_max, delay) caps the backoff,
           // treating NULL as "no cap" and 0 as a real cap. (`?:` would wrongly treat 0 as no cap.)
           const cappedDelay = retryDelayMax != null ? Math.min(retryDelayMax, delay) : delay
