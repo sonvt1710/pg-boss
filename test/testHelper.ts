@@ -67,6 +67,10 @@ const describePostgresOnly = describe.skipIf(isCockroachDb) as SuiteAPI
 const itPglite = it.skipIf(isPglite) as TestAPI
 const describePglite = describe.skipIf(isPglite) as SuiteAPI
 
+// Tests that need multiple independent role connections (e.g. one session holds a lock while
+// another polls) can't run on PGlite (single in-process instance, no network) or CockroachDB.
+const describeMultiConnectionOnly = describe.skipIf(isPglite || isCockroachDb) as SuiteAPI
+
 // LISTEN/NOTIFY is unavailable in these backends' test environments: CockroachDB never implements
 // it (noListenNotify), and the YugabyteDB test container doesn't enable the early-access
 // `ysql_yb_enable_listen_notify` flag. Wrap notify-behavior tests with these so the compatibility
@@ -307,6 +311,7 @@ export {
   describePostgresOnly,
   itPglite,
   describePglite,
+  describeMultiConnectionOnly,
   itListenNotify,
   describeListenNotify,
   getSchemaDefs

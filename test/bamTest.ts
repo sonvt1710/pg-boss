@@ -393,7 +393,7 @@ describe('bam', function () {
   // is what lets pg-boss instances run under different roles without a peer's in-flight build reading
   // as "dead" and getting its live index dropped by the heal step. A held ShareUpdateExclusiveLock —
   // the exact lock CREATE INDEX CONCURRENTLY holds for the whole build — must therefore block reclaim.
-  helper.describePostgresOnly('pg_locks liveness (cross-role safe)', function () {
+  helper.describeMultiConnectionOnly('pg_locks liveness (cross-role safe)', function () {
     it('should not reclaim a stale build while a ShareUpdateExclusiveLock is held on its table, then reclaim once released', async function () {
       const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig })
       boss.on('error', () => {})
