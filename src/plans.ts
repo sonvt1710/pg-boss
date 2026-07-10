@@ -2651,26 +2651,38 @@ export function getNextBamCommand (schema: string, { useLiveness = false }: { us
   }
 
   // Native-Postgres liveness path. An in_progress row counts as "stale" (reclaimable) when it is past
-  // the grace window AND no backend is actually building its index (per pg_stat_progress_create_index).
-  // The same predicate, negated, defines a genuinely-live command that must still block the queue — so
-  // a running build is NEVER reclaimed (no matter how long it runs), and a dead one recovers in minutes.
-  // There is deliberately no 24h absolute cap here: a progress row exists only while a real backend is
-  // building, so liveBuild=true always means a live build; capping on elapsed time would reclaim a
-  // genuinely-running build past 24h and start a second CREATE INDEX CONCURRENTLY on the same index —
-  // the exact double-build this path exists to prevent. Visibility caveat: pg_stat_progress_create_index
-  // only shows rows for the querying role's own backends (or with pg_read_all_stats); pg-boss instances
-  // sharing one DB role — the norm — see each other's builds. If they don't, liveness reads "dead" and a
-  // dead-looking build is reclaimed after the grace window (the timeout-only path's BAM_STALE_SECONDS
-  // fallback covers engines with no progress view at all).
+  // the grace window AND no backend is actually building its index right now. The same predicate,
+  // negated, defines a genuinely-live command that must still block the queue — so a running build is
+  // NEVER reclaimed (no matter how long it runs), and a dead one recovers within the grace window.
+  // There is deliberately no 24h absolute cap here: liveBuild=true always means a build is in flight, so
+  // capping on elapsed time would reclaim a genuinely-running build and start a second
+  // CREATE INDEX CONCURRENTLY on the same index — the exact double-build this path exists to prevent.
+  // (The timeout-only path's BAM_STALE_SECONDS fallback covers engines with no way to detect liveness.)
   //
-  // liveBuild(tableCol): is there a live CREATE INDEX on the row's table in this database? relid (the
-  // table OID) is set in CONCURRENTLY's first transaction, well before the long scans, so it's a
-  // reliable signal for nearly the whole build. Correlating on the table is enough because the queue
-  // only ever runs one in_progress command at a time.
+  // liveBuild(tableCol): is a CREATE INDEX CONCURRENTLY actively building this table's index right now?
+  // Detected via pg_locks, NOT pg_stat_progress_create_index — and that choice is load-bearing for
+  // multi-instance safety. pg_stat_progress_* is filtered to the querying role's OWN backends (only a
+  // superuser or a member of pg_read_all_stats sees another role's builds), so a progress-view check
+  // silently reads a peer's live build as "dead" whenever pg-boss instances connect under different DB
+  // roles — and the heal step (bamHealProbe/bamHealDrop in bam.ts) would then DROP INDEX CONCURRENTLY a
+  // live index mid-build, racing the builder into a double CREATE. pg_locks, by contrast, is cluster-wide
+  // and visible to every role (verified empirically). CREATE INDEX CONCURRENTLY holds a
+  // ShareUpdateExclusiveLock on the target table for the ENTIRE build and releases it the instant the
+  // statement finishes or the backend dies, so a granted SUExclusive lock on the row's table is a
+  // crash-safe, role-agnostic "build in flight" signal — instances may run under different roles with no
+  // loss of safety. Ordinary queue DML never takes SUExclusive (it uses AccessShare/RowShare/
+  // RowExclusive), so it can't false-trigger; a concurrent autovacuum/ANALYZE on the same table DOES take
+  // SUExclusive and reads as "live", but that false positive is in the SAFE direction — it only briefly
+  // DEFERS a reclaim, never drops a live index. Scoped to the current database (l.database) because
+  // pg_locks is cluster-wide while relation OIDs are only unique per database. Correlating on the table
+  // is enough because the queue runs only one in_progress command at a time.
   const liveBuild = (tableCol: string) => `EXISTS (
-    SELECT 1 FROM pg_stat_progress_create_index p
-    WHERE p.datname = current_database()
-      AND p.relid = to_regclass(quote_ident('${schema}') || '.' || quote_ident(${tableCol}))
+    SELECT 1 FROM pg_locks l
+    WHERE l.locktype = 'relation'
+      AND l.granted
+      AND l.mode = 'ShareUpdateExclusiveLock'
+      AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND l.relation = to_regclass(quote_ident('${schema}') || '.' || quote_ident(${tableCol}))
   )`
   const stale = (startedCol: string, tableCol: string) => `(
     ${startedCol} < now() - interval '${BAM_LIVENESS_GRACE_SECONDS} seconds'
@@ -2691,6 +2703,16 @@ export function getNextBamCommand (schema: string, { useLiveness = false }: { us
       )
       ORDER BY (c.status != 'pending'), c.created_on
       LIMIT 1
+      -- Defense-in-depth against a double-claim. The upstream trySetBamTime throttle serializes healers
+      -- to one per interval, but a build running longer than bamIntervalSeconds lets a second instance
+      -- pass the throttle while the first is still working. FOR UPDATE SKIP LOCKED makes the claim itself
+      -- mutually exclusive: whichever instance locks the head row wins; the other skips it (and, with
+      -- LIMIT 1, claims nothing) rather than re-running the same UPDATE and re-driving the command with a
+      -- stale prior_status. OF c scopes the lock to the candidate row only, so the NOT EXISTS probe over
+      -- bam g is never itself locked. Postgres-only path — SKIP LOCKED is deliberately absent from the
+      -- timeout-only variant, which also serves CockroachDB/YugabyteDB where it performs poorly and can
+      -- skip unexpectedly.
+      FOR UPDATE OF c SKIP LOCKED
     )
     UPDATE ${schema}.bam b
     SET status = 'in_progress', started_on = now()

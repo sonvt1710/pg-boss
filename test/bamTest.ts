@@ -1,4 +1,5 @@
 import { describe, it } from 'vitest'
+import pg from 'pg'
 import { ctx, expect } from './hooks.ts'
 import * as helper from './testHelper.ts'
 import { PgBoss } from '../src/index.ts'
@@ -26,6 +27,16 @@ async function insertBamRow (schema: string, name: string, status: string, comma
     INSERT INTO ${schema}.bam (name, version, status, table_name, command, started_on)
     VALUES ($1, 27, $2, 'job_common', $3, ${startedOn})
   `, [name, status, command])
+  await db.close()
+}
+
+async function insertBamRowOnTable (schema: string, name: string, status: string, command: string, tableName: string, startedAgoSeconds?: number) {
+  const db = await helper.getDb()
+  const startedOn = startedAgoSeconds != null ? `now() - interval '${startedAgoSeconds} seconds'` : 'NULL'
+  await db.executeSql(`
+    INSERT INTO ${schema}.bam (name, version, status, table_name, command, started_on)
+    VALUES ($1, 27, $2, $4, $3, ${startedOn})
+  `, [name, status, command, tableName])
   await db.close()
 }
 
@@ -375,6 +386,55 @@ describe('bam', function () {
       expect(fresh.status).toBe('in_progress')
       expect(pending.status).toBe('pending')
     }, 10000)
+  })
+
+  // The liveness signal for reclaiming a stale in_progress build is pg_locks (cluster-wide, visible
+  // across DB roles), not pg_stat_progress_create_index (filtered to the caller's own backends). This
+  // is what lets pg-boss instances run under different roles without a peer's in-flight build reading
+  // as "dead" and getting its live index dropped by the heal step. A held ShareUpdateExclusiveLock —
+  // the exact lock CREATE INDEX CONCURRENTLY holds for the whole build — must therefore block reclaim.
+  helper.describePostgresOnly('pg_locks liveness (cross-role safe)', function () {
+    it('should not reclaim a stale build while a ShareUpdateExclusiveLock is held on its table, then reclaim once released', async function () {
+      const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig })
+      boss.on('error', () => {})
+
+      const db = await helper.getDb()
+      await db.executeSql(`CREATE TABLE ${ctx.schema}.live_tbl (a int)`)
+      await db.close()
+
+      // A separate backend stands in for an in-flight CREATE INDEX CONCURRENTLY by holding the very lock
+      // one takes — ShareUpdateExclusiveLock — on the build's table for the whole window.
+      const holder = new pg.Client({ connectionString: helper.getConnectionString() })
+      await holder.connect()
+      await holder.query('BEGIN')
+      await holder.query(`LOCK TABLE ${ctx.schema}.live_tbl IN SHARE UPDATE EXCLUSIVE MODE`)
+
+      try {
+        // Stale by the liveness grace window (backdated well past BAM_LIVENESS_GRACE_SECONDS), but its
+        // table shows a live build in pg_locks, so liveBuild=true → the row must NOT be reclaimed.
+        await insertBamRowOnTable(ctx.schema, 'locked_cmd', 'in_progress', 'SELECT 1', 'live_tbl', 10 * 60)
+
+        await triggerBamPoll(ctx.schema)
+        await delay(1500)
+
+        let entry = (await boss.getBamEntries()).find((e: any) => e.name === 'locked_cmd')
+        helper.assertTruthy(entry)
+        expect(entry.status).toBe('in_progress') // held lock reads as a live build → reclaim blocked
+
+        // Release the lock: the "build" is gone, so the same stale row becomes reclaimable and runs.
+        await holder.query('ROLLBACK')
+
+        const done = waitForBamEvent(boss, 'locked_cmd', 'completed')
+        await triggerBamPoll(ctx.schema)
+        await done
+
+        entry = (await boss.getBamEntries()).find((e: any) => e.name === 'locked_cmd')
+        helper.assertTruthy(entry)
+        expect(entry.status).toBe('completed')
+      } finally {
+        await holder.end()
+      }
+    }, 15000)
   })
 
   describe('successful execution', function () {
