@@ -26,7 +26,34 @@ npx pg-boss --help
 | `version` | Show current schema version |
 | `doctor` | Check for schema drift (indexes, functions, enum) against the expected schema |
 | `rollback` | Rollback the last migration |
-| `plans <subcommand>` | Output SQL without executing (subcommands: `create`, `migrate`, `rollback`) |
+| `plans <subcommand>` | Output SQL without executing (subcommands: `create` (alias `construct`), `migrate`, `rollback`; defaults to `migrate`) |
+
+Every command reads its connection from the same sources (see [Connection Configuration](#connection-configuration)). Commands that touch the database exit `1` on error.
+
+### `migrate`
+
+Brings the schema up to the latest version, running any pending migrations in order. If pg-boss is not yet installed, it creates the schema first (equivalent to `create`). If the schema is already current, it reports that and does nothing. Async index builds (normally run by the background worker) are inlined as `CREATE INDEX CONCURRENTLY` statements and fanned out across every partitioned queue table, so a migration run needs no live worker. Pass `--dry-run` to print the SQL — rendered from the database's actual current version — without executing it.
+
+```bash
+pg-boss migrate --connection-string postgres://localhost/myapp
+pg-boss migrate --connection-string postgres://localhost/myapp --dry-run
+```
+
+### `create`
+
+Installs the pg-boss schema from scratch at the latest version. If pg-boss is already installed in the target schema, it reports the existing version and makes no changes (use `migrate` to upgrade). Pass `--dry-run` to print the `CREATE` SQL without executing it.
+
+```bash
+pg-boss create --connection-string postgres://localhost/myapp
+```
+
+### `version`
+
+Prints the installed schema version, the latest version pg-boss ships, and the number of pending migrations (or that the schema is up to date). Reports if pg-boss is not installed in the schema.
+
+```bash
+pg-boss version --connection-string postgres://localhost/myapp
+```
 
 ### `doctor`
 
@@ -71,6 +98,38 @@ CONSTRAINT DRIFT (missing or unexpected constraints) (1):
 
 `doctor` only diagnoses — it never changes the schema, and because it runs against a schema that is already at the latest version, a restart or `migrate` will not repair the drift it finds. Copy the printed statement to fix an index (insert `CONCURRENTLY` on a live table). See [Remediation](api/ops#detectschemadrift) for how to fix each category (recreate a missing index, drop a stale one, and so on).
 
+### `rollback`
+
+Reverts the last migration, moving the schema back one version. It refuses to go below the minimum version (prints `Cannot rollback: already at minimum version`) and reports if pg-boss is not installed. Pass `--dry-run` to print the rollback SQL without executing it.
+
+```bash
+pg-boss rollback --connection-string postgres://localhost/myapp
+pg-boss rollback --connection-string postgres://localhost/myapp --dry-run
+```
+
+### `plans <subcommand>`
+
+Prints SQL to stdout without touching the database — useful for review, manual execution, or checking into version control. Subcommands:
+
+| Subcommand | Output |
+|------------|--------|
+| `create` (alias `construct`) | SQL to install the schema at the latest version |
+| `migrate` (default) | SQL to migrate from version 0 to the latest, with async index builds inlined |
+| `rollback` | SQL to roll back one version from the latest |
+
+A connection is **optional**. Given one, `plans migrate` enumerates the partitioned queue tables so per-partition index builds are included; without one, it emits a `job_common`-only script and prints a note. All other subcommands need no connection.
+
+```bash
+# Output install SQL for a custom schema (no connection needed)
+pg-boss plans create --schema myapp_jobs
+
+# Output migration SQL, including per-partition index builds
+pg-boss plans migrate --connection-string postgres://localhost/myapp
+
+# Output rollback SQL
+pg-boss plans rollback --schema myapp_jobs
+```
+
 ## Connection Configuration
 
 The CLI supports multiple ways to configure the database connection, in order of precedence:
@@ -87,7 +146,11 @@ The CLI supports multiple ways to configure the database connection, in order of
    PGBOSS_DATABASE_URL=postgres://user:pass@host/database pg-boss migrate
    # or individual variables
    PGBOSS_HOST=localhost PGBOSS_PORT=5432 PGBOSS_DATABASE=mydb PGBOSS_USER=postgres PGBOSS_PASSWORD=secret pg-boss migrate
+   # schema name (default: pgboss)
+   PGBOSS_SCHEMA=myapp_jobs pg-boss migrate
    ```
+
+   Supported: `PGBOSS_DATABASE_URL`, `PGBOSS_HOST`, `PGBOSS_PORT`, `PGBOSS_DATABASE`, `PGBOSS_USER`, `PGBOSS_PASSWORD`, `PGBOSS_SCHEMA`.
 
    This allows admin credentials for migrations to coexist with regular application database credentials (e.g., `DATABASE_URL` for the app, `PGBOSS_DATABASE_URL` for migrations).
 
@@ -112,15 +175,19 @@ The CLI supports multiple ways to configure the database connection, in order of
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--connection-string` | `-c` | PostgreSQL connection string |
+| `--connection-string` | | PostgreSQL connection string |
 | `--host` | | Database host |
 | `--port` | | Database port |
 | `--database` | `-d` | Database name |
 | `--user` | `-u` | Database user |
 | `--password` | `-p` | Database password |
 | `--schema` | `-s` | pg-boss schema name (default: pgboss) |
-| `--config` | | Path to config file |
-| `--dry-run` | | Show SQL without executing (for migrate, create, rollback) |
+| `--config` | `-c` | Path to config file (default: pgboss.json, .pgbossrc, .pgbossrc.json) |
+| `--ssl` | | Enable SSL connection (`rejectUnauthorized: false`) |
+| `--dry-run` | | Show SQL without executing (for `migrate`, `create`, `rollback`) |
+| `--help` | `-h` | Show help |
+
+> **Note:** `-c` is the short form for `--config` (a config file path), **not** `--connection-string`. The connection string has no short form.
 
 ## Examples
 
@@ -135,13 +202,16 @@ PGBOSS_DATABASE_URL=$PGBOSS_DATABASE_URL pg-boss migrate
 pg-boss migrate --connection-string postgres://localhost/myapp --dry-run
 
 # Check current schema version
-pg-boss version -c postgres://localhost/myapp
+pg-boss version --connection-string postgres://localhost/myapp
 
 # Check for schema drift (exits 1 if drift is found)
-pg-boss doctor -c postgres://localhost/myapp
+pg-boss doctor --connection-string postgres://localhost/myapp
 
 # Use a custom schema name
-pg-boss migrate -c postgres://localhost/myapp --schema myapp_jobs
+pg-boss migrate --connection-string postgres://localhost/myapp --schema myapp_jobs
+
+# Load connection from a config file
+pg-boss migrate -c ./config/pgboss.json
 
 # Output SQL for creating schema (useful for review or manual execution)
 pg-boss plans create --schema myapp_jobs
