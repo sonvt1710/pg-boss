@@ -243,6 +243,9 @@ describe('bam', function () {
       // skip, leaving the wrong index in place; healing must drop it and rebuild on the right column.
       await db.executeSql(`CREATE TABLE ${ctx.schema}.heal_test (a int, b int)`)
       await db.executeSql(`CREATE INDEX heal_idx ON ${ctx.schema}.heal_test (a)`)
+      // Make it INVALID, as a crashed CREATE INDEX CONCURRENTLY leaves it — healing only drops an
+      // invalid leftover, so a valid same-named index would (correctly) be left alone and not rebuilt.
+      await db.executeSql(`UPDATE pg_index SET indisvalid = false WHERE indexrelid = '${ctx.schema}.heal_idx'::regclass`)
 
       const command = `CREATE INDEX CONCURRENTLY IF NOT EXISTS heal_idx ON ${ctx.schema}.heal_test (b)`
       await insertBamRow(ctx.schema, 'heal_cmd', 'in_progress', command, 25 * 60 * 60)
@@ -269,6 +272,8 @@ describe('bam', function () {
       const db = await helper.getDb()
       await db.executeSql(`CREATE TABLE ${ctx.schema}.heal_test (a int, b int)`)
       await db.executeSql(`CREATE INDEX heal_idx ON ${ctx.schema}.heal_test (a)`)
+      // Invalid leftover, as a crashed/failed CONCURRENTLY build leaves it (see note above).
+      await db.executeSql(`UPDATE pg_index SET indisvalid = false WHERE indexrelid = '${ctx.schema}.heal_idx'::regclass`)
 
       // A 'failed' row (as an older release, or a genuinely-failed CONCURRENTLY build, would leave)
       // must also heal on retry — otherwise the command's IF NOT EXISTS skips the stale index forever.
@@ -287,6 +292,40 @@ describe('bam', function () {
       expect(rows).toHaveLength(1)
       expect(rows[0].indexdef).toContain('(b)')
       expect(rows[0].indexdef).not.toContain('(a)')
+    }, 10000)
+
+    it('does NOT drop a VALID leftover index on reattempt (build succeeded but row was never marked)', async function () {
+      // The dangerous case: a CREATE INDEX CONCURRENTLY that actually succeeded (VALID index, in use)
+      // but whose bam row stayed in_progress because a graceful stop landed between the CREATE and
+      // markCompleted. On reattempt, healing must NOT drop this live index — it should skip the drop,
+      // let the command's IF NOT EXISTS no-op, and mark the row completed with the index intact.
+      const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, ...bamConfig })
+      boss.on('error', () => {})
+
+      const db = await helper.getDb()
+      await db.executeSql(`CREATE TABLE ${ctx.schema}.heal_test (a int, b int)`)
+      // Valid index matching what the command builds — stands in for the already-succeeded build.
+      await db.executeSql(`CREATE INDEX heal_idx ON ${ctx.schema}.heal_test (a)`)
+
+      const command = `CREATE INDEX CONCURRENTLY IF NOT EXISTS heal_idx ON ${ctx.schema}.heal_test (a)`
+      await insertBamRow(ctx.schema, 'valid_cmd', 'in_progress', command, 25 * 60 * 60)
+
+      const done = waitForBamEvent(boss, 'valid_cmd', 'completed')
+      await triggerBamPoll(ctx.schema)
+      await done
+
+      const { rows } = await db.executeSql(
+        `SELECT indexdef, i.indisvalid AS valid
+         FROM pg_indexes p JOIN pg_class c ON c.relname = p.indexname
+         JOIN pg_index i ON i.indexrelid = c.oid
+         WHERE p.schemaname = '${ctx.schema}' AND p.indexname = 'heal_idx'`
+      )
+      await db.close()
+
+      // Index untouched: still valid, still on (a) — it was never dropped.
+      expect(rows).toHaveLength(1)
+      expect(rows[0].valid).toBe(true)
+      expect(rows[0].indexdef).toContain('(a)')
     }, 10000)
 
     it('should not heal on backends without pg_stat_progress_create_index (timeout-only reclaim)', async function () {

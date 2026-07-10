@@ -177,10 +177,20 @@ describe('drift', function () {
       expect(drifter.indexPredicate('CREATE INDEX x ON s.t (a)')).toBe('')
     })
 
-    it('normalizes a hand-written and a canonicalized predicate to the same value', function () {
-      const expected = drifter.indexPredicate("CREATE UNIQUE INDEX job_i1 ON x.job (name) WHERE state = 'created' AND policy = 'short'")
-      const live = drifter.indexPredicate("CREATE UNIQUE INDEX job_i1 ON s.job USING btree (name) WHERE ((state = 'created'::s.job_state) AND (policy = 'short'::text))")
-      expect(live).toBe(expected)
+    it('normalizes two catalog-canonical predicates equal despite casts, whitespace and outer parens', function () {
+      // Both expected (manifest) and live come from pg_get_indexdef, so both carry the same per-conjunct
+      // parens; normalization only strips casts, the redundant OUTER wrapper, and whitespace.
+      const a = drifter.indexPredicate("CREATE UNIQUE INDEX job_i1 ON s.job USING btree (name) WHERE ((state = 'created'::s.job_state) AND (policy = 'short'::text))")
+      const b = drifter.indexPredicate("CREATE UNIQUE INDEX job_i1 ON x.job (name) WHERE (  (state = 'created')   AND   (policy = 'short')  )")
+      expect(b).toBe(a)
+    })
+
+    it('preserves inner grouping so a regrouped AND/OR predicate is detected as different', function () {
+      // The reason normalization strips only the OUTER parens: two predicates that differ only in how
+      // their AND/OR terms are grouped must NOT normalize equal, or real drift would slip through.
+      const g1 = drifter.indexPredicate('CREATE INDEX x ON s.t (a) WHERE ((a OR b) AND c)')
+      const g2 = drifter.indexPredicate('CREATE INDEX x ON s.t (a) WHERE (a OR (b AND c))')
+      expect(g1).not.toBe(g2)
     })
 
     it('folds IN (...) and = ANY (ARRAY[...]) to the same value', function () {
@@ -235,7 +245,8 @@ describe('drift', function () {
   })
 
   describe('computeSchemaDrift definition-diff (pure)', function () {
-    const expected = [{ name: 'job_common_i9', table: 'job_common', keys: 'name, id', predicate: "blocking AND state = 'completed'" }]
+    // Canonical (per-conjunct parens), matching what expectedManagedIndexes derives from pg_get_indexdef.
+    const expected = [{ name: 'job_common_i9', table: 'job_common', keys: 'name, id', predicate: "blocking AND (state = 'completed')" }]
 
     it('reports ok when keys and predicate match', function () {
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: true, def: "CREATE INDEX job_common_i9 ON pgboss.job_common USING btree (name, id) WHERE (blocking AND (state = 'completed'::pgboss.job_state))" }]
@@ -693,9 +704,14 @@ describe('drift', function () {
 
       const db = await helper.getDb()
       await db.executeSql(`DROP INDEX ${schema}.${table}_i5`)
+      // Insert as a fresh in_progress build, not pending: the started boss runs a live BAM worker, and a
+      // 'pending' row would be picked up and actually built (CREATE INDEX CONCURRENTLY) before the drift
+      // scan runs — a race that leaves `building` empty. A non-stale in_progress row is neither a pending
+      // pickup nor stale-reclaimable, so the worker leaves it alone while it still counts as an
+      // incomplete build the drift check reports as `building`.
       await db.executeSql(
-        `INSERT INTO ${schema}.bam (name, version, status, table_name, command)
-         VALUES ($1, 27, 'pending', $2, $3)`,
+        `INSERT INTO ${schema}.bam (name, version, status, started_on, table_name, command)
+         VALUES ($1, 27, 'in_progress', now(), $2, $3)`,
         ['drift-build', table, `CREATE INDEX CONCURRENTLY ${table}_i5 ON ${schema}.${table} (name, start_after)`]
       )
       await db.close()
@@ -773,21 +789,58 @@ describe('drift', function () {
       // A backend that rejects the function/enum/column/constraint catalog queries must not abort the
       // whole scan — each falls back to empty. Stub db throws on those four, returns empty otherwise.
       const throwOn = [/pg_get_functiondef/, /pg_enum/, /pg_attribute/, /pg_get_constraintdef/]
+      // Table presence comes from its own pg_class probe (relkind IN ('r','p'), no pg_attribute), which
+      // stays available even though the column query throws — return the real managed tables for it so
+      // the decoupling can be asserted below.
+      const managedTables = plans.expectedManagedTables('pgboss', false)
       const db = {
         executeSql: async (text: string) => {
           if (throwOn.some(re => re.test(text))) throw new Error('catalog unsupported')
           if (/to_regclass/.test(text)) return { rows: [{ name: null }] } // non-partitioned probe
+          if (/relkind IN \('r', 'p'\)/.test(text)) return { rows: managedTables.map(t => ({ table: t })) }
           return { rows: [] }
         }
       }
       const contractor = new Contractor(db as any, { schema: 'pgboss' } as any)
       const report = await contractor.detectDrift()
 
-      // the throwing queries left their checks empty; the scan still produced a report
-      expect(report.missingFunctions.length).toBeGreaterThan(0) // live functions threw -> all expected missing
+      // the throwing queries SKIP their checks; the scan still produced a report and did not false-flag.
+      // A thrown function query means "unsupported / could not read", NOT "no functions exist" — so the
+      // function check is skipped, not reported as every expected function missing (which would flip `ok`
+      // to false on every scan against a backend like CockroachDB that rejects pg_get_functiondef).
+      expect(report.missingFunctions).toHaveLength(0)
+      expect(report.mismatchedFunctions).toHaveLength(0)
       expect(report.columnDrift).toHaveLength(0)
       expect(report.constraintDrift).toHaveLength(0)
       expect(report.enumDrift).toBeNull()
+      // Table presence is read from pg_class, NOT derived from the (thrown) column query, so a failing
+      // column diff does not false-report every managed table as missing.
+      expect(report.missingTables).toHaveLength(0)
+    })
+
+    it('falls back to the columns-derived table set when the pg_class table probe throws', async function () {
+      // Inverse of the case above: the dedicated pg_class table probe fails but the column query
+      // succeeds. Table presence must then fall back to the tables seen in the column rows rather than
+      // aborting or reporting everything missing. (getSchemaTables is the relkind probe WITHOUT
+      // pg_attribute; getSchemaColumns also filters on relkind but joins pg_attribute.)
+      const managedTables = plans.expectedManagedTables('pgboss', false)
+      const db = {
+        executeSql: async (text: string) => {
+          const isTableProbe = /relkind IN \('r', 'p'\)/.test(text) && !/pg_attribute/.test(text)
+          if (isTableProbe) throw new Error('pg_class unavailable')
+          if (/to_regclass/.test(text)) return { rows: [{ name: null }] } // non-partitioned probe
+          if (/pg_attribute/.test(text)) {
+            // one column row per managed table, so the fallback set covers every expected table
+            return { rows: managedTables.map(t => ({ table: t, column: 'id', default: null, type: 'text', notNull: true })) }
+          }
+          return { rows: [] }
+        }
+      }
+      const contractor = new Contractor(db as any, { schema: 'pgboss' } as any)
+      const report = await contractor.detectDrift()
+
+      // fell back to the column-derived table set (which covers every expected table) — no false missing.
+      expect(report.missingTables).toHaveLength(0)
     })
 
     it('handles a non-partitioned schema and a missing bam table', async function () {

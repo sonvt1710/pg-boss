@@ -62,6 +62,11 @@ const BACKEND_PROFILES: Record<types.BackendProfile, BackendDefinition> = {
       noIndexProgressView: true
     }
   },
+  // No noIndexProgressView: pg-boss keeps its tables coordinator-local (it never calls
+  // create_distributed_table), so CREATE INDEX CONCURRENTLY runs against ordinary local Postgres tables
+  // on the coordinator, where pg_stat_progress_create_index is accurate and liveness-based reclaim is
+  // valid. This holds ONLY while the tables stay coordinator-local — if they are ever distributed, the
+  // coordinator's progress view would misread in-flight worker builds as dead and BAM could double-build.
   citus: { kind: 'distributed', flags: {} },
   pglite: { kind: 'embedded', flags: {} }
 }

@@ -2650,14 +2650,18 @@ export function getNextBamCommand (schema: string, { useLiveness = false }: { us
     `
   }
 
-  // Native-Postgres liveness path. An in_progress row counts as "stale" (reclaimable) when either the
-  // 24h fallback elapsed, or it's past the grace window AND no backend is actually building its index
-  // (per pg_stat_progress_create_index). The same predicate, negated, defines a genuinely-live command
-  // that must still block the queue — so a running build is never reclaimed, and a dead one recovers in
-  // minutes instead of a day. Visibility caveat: pg_stat_progress_create_index only shows rows for the
-  // querying role's own backends (or with pg_read_all_stats); pg-boss instances sharing one DB role —
-  // the norm — see each other's builds. If they don't, liveness reads "dead" and the 24h fallback still
-  // caps the exposure.
+  // Native-Postgres liveness path. An in_progress row counts as "stale" (reclaimable) when it is past
+  // the grace window AND no backend is actually building its index (per pg_stat_progress_create_index).
+  // The same predicate, negated, defines a genuinely-live command that must still block the queue — so
+  // a running build is NEVER reclaimed (no matter how long it runs), and a dead one recovers in minutes.
+  // There is deliberately no 24h absolute cap here: a progress row exists only while a real backend is
+  // building, so liveBuild=true always means a live build; capping on elapsed time would reclaim a
+  // genuinely-running build past 24h and start a second CREATE INDEX CONCURRENTLY on the same index —
+  // the exact double-build this path exists to prevent. Visibility caveat: pg_stat_progress_create_index
+  // only shows rows for the querying role's own backends (or with pg_read_all_stats); pg-boss instances
+  // sharing one DB role — the norm — see each other's builds. If they don't, liveness reads "dead" and a
+  // dead-looking build is reclaimed after the grace window (the timeout-only path's BAM_STALE_SECONDS
+  // fallback covers engines with no progress view at all).
   //
   // liveBuild(tableCol): is there a live CREATE INDEX on the row's table in this database? relid (the
   // table OID) is set in CONCURRENTLY's first transaction, well before the long scans, so it's a
@@ -2669,8 +2673,8 @@ export function getNextBamCommand (schema: string, { useLiveness = false }: { us
       AND p.relid = to_regclass(quote_ident('${schema}') || '.' || quote_ident(${tableCol}))
   )`
   const stale = (startedCol: string, tableCol: string) => `(
-    ${startedCol} < now() - interval '${BAM_STALE_SECONDS} seconds'
-    OR (${startedCol} < now() - interval '${BAM_LIVENESS_GRACE_SECONDS} seconds' AND NOT ${liveBuild(tableCol)})
+    ${startedCol} < now() - interval '${BAM_LIVENESS_GRACE_SECONDS} seconds'
+    AND NOT ${liveBuild(tableCol)}
   )`
 
   return `
@@ -2712,6 +2716,26 @@ export function bamHealDrop (schema: string, command: string): string | null {
   const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?("?[\w$]+"?)/i)
   if (!match) return null
   return `DROP INDEX CONCURRENTLY IF EXISTS ${schema}.${match[1]}`
+}
+
+// Probe run before bamHealDrop: returns `invalid = true` only when the index the re-attempted command
+// would build already exists AND is INVALID (an interrupted CREATE INDEX CONCURRENTLY left a stub).
+// A build that actually finished but whose BAM row was never marked completed — e.g. a graceful stop
+// landed between the CREATE succeeding and markCompleted — leaves a VALID index; dropping that would
+// tear down a live production index for the whole rebuild window, so the caller must NOT heal it (the
+// re-run's own IF NOT EXISTS then no-ops and just marks the row done). Returns null for non-index
+// commands and for an absent index (no row), where there is nothing to drop. Mirrors bamHealDrop's
+// CONCURRENTLY-only recognition so it is non-null exactly when bamHealDrop is.
+export function bamHealProbe (schema: string, command: string): string | null {
+  const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([\w$]+)"?/i)
+  if (!match) return null
+  return `
+    SELECT NOT i.indisvalid AS invalid
+    FROM pg_class c
+    JOIN pg_index i ON i.indexrelid = c.oid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = '${schema.replace(SINGLE_QUOTE_REGEX, "''")}' AND c.relname = '${match[1].replace(SINGLE_QUOTE_REGEX, "''")}'
+  `
 }
 
 export function setBamCompleted (schema: string, id: string) {

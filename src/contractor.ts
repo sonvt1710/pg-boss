@@ -89,13 +89,18 @@ class Contractor {
     }
 
     // Function-body and enum drift are best-effort: pg_get_functiondef is unsupported on some backends
-    // (CockroachDB), so a failure here leaves those checks empty rather than aborting the whole scan.
+    // (CockroachDB), so a failure here SKIPS the function check rather than aborting the whole scan.
+    // `functionsSupported` must be tracked separately from an empty result: an empty `liveFunctions`
+    // means "query failed / unsupported", which is NOT the same as "no functions found" — feeding
+    // `live: []` to the drift check would report every expected function as missing and flip `ok` to
+    // false on every CockroachDB scan. So the check is gated (passed `undefined`) when the query throws.
     let liveFunctions: Array<{ name: string, def: string }> = []
+    let functionsSupported = true
     try {
       const fnResult = await this.db.executeSql(drifter.getSchemaFunctions(schema))
       liveFunctions = fnResult.rows.map((r: { name: string, def: string }) => ({ name: r.name, def: r.def }))
     } catch {
-      liveFunctions = []
+      functionsSupported = false
     }
 
     let enumLabels: string[] = []
@@ -104,6 +109,19 @@ class Contractor {
       enumLabels = enumResult.rows.map((r: { label: string }) => r.label)
     } catch {
       enumLabels = []
+    }
+
+    // Table presence is read from a catalog-only query independent of the column diff below. The column
+    // query uses pg_get_expr (unsupported on some backends) and is best-effort; if it throws, the column
+    // check is skipped — but table presence must NOT collapse to "everything missing", so it comes from
+    // its own pg_class probe. pg_class is available everywhere, so this rarely throws; if it somehow
+    // does, fall back to the columns-derived set rather than aborting the scan.
+    let liveTables: string[] | null = null
+    try {
+      const tableResult = await this.db.executeSql(drifter.getSchemaTables(schema))
+      liveTables = tableResult.rows.map((r: { table: string }) => r.table)
+    } catch {
+      liveTables = null
     }
 
     let liveColumns: Array<{ table: string, column: string, default?: string | null, type?: string, notNull?: boolean }> = []
@@ -135,8 +153,8 @@ class Contractor {
 
     return drifter.computeSchemaDrift({
       indexes: { expected: plans.expectedManagedIndexes(schema, partitioned, partitions), live, building },
-      tables: { expected: plans.expectedManagedTables(schema, partitioned, partitions), live: [...new Set(liveColumns.map(c => c.table))] },
-      functions: { expected: plans.expectedManagedFunctions(schema, partitioned), live: liveFunctions },
+      tables: { expected: plans.expectedManagedTables(schema, partitioned, partitions), live: liveTables ?? [...new Set(liveColumns.map(c => c.table))] },
+      functions: functionsSupported ? { expected: plans.expectedManagedFunctions(schema, partitioned), live: liveFunctions } : undefined,
       columns: { expected: expectedColumns, live: liveColumns },
       constraints: canonicalPg ? { expected: plans.expectedManagedConstraints(schema, partitioned), live: liveConstraints } : undefined,
       enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: enumLabels }

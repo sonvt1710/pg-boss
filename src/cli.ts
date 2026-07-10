@@ -5,7 +5,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import Db from './db.ts'
 import * as plans from './plans.ts'
-import * as drifter from './drifter.ts'
+import Contractor from './contractor.ts'
 import * as migrationStore from './migrationStore.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import type * as types from './types.ts'
@@ -388,61 +388,12 @@ async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> 
       console.log(`⚠ Migrations pending: ${schemaVersion - version} — run "pg-boss migrate" before trusting drift results`)
     }
 
-    // Read partitioned vs. non-partitioned from the database, then compute the expected index set.
-    const probe = await db.executeSql(plans.jobCommonExists(schema))
-    const partitioned = !!probe.rows[0].name
-    const partitions = partitioned
-      ? (await db.executeSql(plans.getManagedQueuePartitions(schema))).rows
-      : []
-    const live = (await db.executeSql(drifter.getSchemaIndexes(schema))).rows
-
-    let bamCommands: string[] = []
-    try {
-      bamCommands = (await db.executeSql(plans.getIncompleteBamCommands(schema))).rows.map((r: { command: string }) => r.command)
-    } catch {
-      // pre-v27 schema without a bam table
-    }
-
-    // Function-body / enum drift is best-effort (pg_get_functiondef is unsupported on some backends).
-    let liveFunctions: Array<{ name: string, def: string }> = []
-    try {
-      liveFunctions = (await db.executeSql(drifter.getSchemaFunctions(schema))).rows.map((r: { name: string, def: string }) => ({ name: r.name, def: r.def }))
-    } catch {
-      // backend without pg_get_functiondef
-    }
-
-    let enumLabels: string[] = []
-    try {
-      enumLabels = (await db.executeSql(drifter.getEnumDefinition(schema))).rows.map((r: { label: string }) => r.label)
-    } catch {
-      // backend without enums
-    }
-
-    let liveColumns: Array<{ table: string, column: string, default?: string | null, type?: string, notNull?: boolean }> = []
-    try {
-      liveColumns = (await db.executeSql(drifter.getSchemaColumns(schema))).rows.map((r: { table: string, column: string, default: string | null, type: string, notNull: boolean }) =>
-        ({ table: r.table, column: r.column, default: r.default, type: r.type, notNull: r.notNull }))
-    } catch {
-      // catalog unavailable
-    }
-
-    let liveConstraints: Array<{ table: string, def: string }> = []
-    try {
-      liveConstraints = (await db.executeSql(drifter.getSchemaConstraints(schema))).rows.map((r: { table: string, def: string }) => ({ table: r.table, def: r.def }))
-    } catch {
-      // catalog unavailable
-    }
-
-    const building = new Set(bamCommands.map(plans.bamCommandIndexName).filter((n): n is string => n !== null))
-
-    const report = drifter.computeSchemaDrift({
-      indexes: { expected: plans.expectedManagedIndexes(schema, partitioned, partitions), live, building },
-      tables: { expected: plans.expectedManagedTables(schema, partitioned, partitions), live: [...new Set(liveColumns.map(c => c.table))] },
-      functions: { expected: plans.expectedManagedFunctions(schema, partitioned), live: liveFunctions },
-      columns: { expected: plans.expectedManagedColumns(schema, partitioned, partitions), live: liveColumns },
-      constraints: { expected: plans.expectedManagedConstraints(schema, partitioned), live: liveConstraints },
-      enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: enumLabels }
-    })
+    // Reuse the same drift scan the boss.detectSchemaDrift() API runs, rather than duplicating the
+    // catalog queries + computeSchemaDrift wiring here (the two copies had already drifted apart and
+    // carried divergent best-effort/backend-gating bugs). Contractor.detectDrift handles the
+    // partitioned probe, best-effort catalog fallbacks, and backend-specific gating in one place.
+    const contractor = new Contractor(db, { ...config, schema } as unknown as types.ResolvedConstructorOptions)
+    const report = await contractor.detectDrift()
 
     if (report.building.length) {
       console.log(`\nBuilding (async index build in progress — not yet drift) (${report.building.length}):`)

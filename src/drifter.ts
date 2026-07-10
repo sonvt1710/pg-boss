@@ -45,22 +45,24 @@ function extractPredicate (ddl: string): string {
   return m ? ddl.slice(m.index! + m[0].length) : ''
 }
 
-// Normalises a predicate so a hand-written WHERE and pg_get_indexdef's canonicalised form compare
-// equal. pg_get_indexdef rewrites predicates heavily, so this undoes each transformation:
+// Normalises a predicate for comparison. Both sides originate from pg_get_indexdef — expected from the
+// manifest, live from the catalog — so both carry pg's canonical form; this only undoes the cosmetic
+// differences pg can vary between two equal predicates:
 //   - casts added to every literal (`'active'::pgboss.job_state`, `'x'::text`) → stripped
 //   - `IN (a, b)` rendered as `= ANY (ARRAY[a, b])` → folded back to `IN (a, b)`
-//   - redundant parentheses wrapped around every sub-expression → removed
+//   - the redundant OUTER paren pair pg wraps the whole predicate in → removed
 //   - case/whitespace differences → normalised away
-// Parens are dropped entirely, so this only stays sound for flat boolean predicates (the pg-boss set
-// is all conjunctions of simple comparisons); mixed AND/OR grouping is out of scope.
+// INNER grouping parens are deliberately KEPT: pg parenthesises each sub-expression identically for two
+// equal predicates, so keeping them is symmetric, and it lets a real regrouping (`(a OR b) AND c` vs
+// `a OR (b AND c)`) be detected as drift instead of both collapsing to the same token soup. This is why
+// the whole-predicate paren strip must be OUTER-only (stripOuterParens), not a blanket paren removal.
 function normalizePredicate (predicate: string): string {
-  return predicate
+  const folded = predicate
     .toLowerCase()
     .replace(/"/g, '')
     .replace(CAST_REGEX, '')
     .replace(/=\s*any\s*\(\s*array\s*\[([^\]]*)\]\s*\)/g, 'in ($1)')
-    .replace(/[()]/g, '')
-    .replace(/\s+/g, '')
+  return stripOuterParens(folded).replace(/\s+/g, '')
 }
 
 export function indexPredicate (ddl: string): string {
@@ -212,6 +214,22 @@ export function getSchemaColumns (schema: string) {
     LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
     WHERE n.nspname = '${schema.replace(SINGLE_QUOTE_REGEX, "''")}'
       AND a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'p')
+  `
+}
+
+// Every ordinary ('r') or partitioned ('p') table in the schema, catalog-only (pg_class), for the
+// table-presence check. Deliberately independent of getSchemaColumns: that query uses pg_get_expr,
+// which is unsupported on some backends and is wrapped in a best-effort try/catch — deriving table
+// presence from its (possibly empty-on-failure) result would false-report every managed table as
+// missing whenever the column query throws. pg_class is available everywhere, so table presence stays
+// reliable even when the column diff is skipped.
+export function getSchemaTables (schema: string) {
+  return `
+    SELECT c.relname AS "table"
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = '${schema.replace(SINGLE_QUOTE_REGEX, "''")}'
+      AND c.relkind IN ('r', 'p')
   `
 }
 

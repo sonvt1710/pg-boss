@@ -110,7 +110,17 @@ class Bam extends EventEmitter implements types.EventsMixin {
       if (entry.reattempt && !this.#config.noIndexProgressView) {
         const dropSql = plans.bamHealDrop(this.#config.schema, entry.command)
         if (dropSql) {
-          await this.#db.executeSql(dropSql)
+          // Only heal an index the previous attempt left INVALID. A re-attempt can also fire for a
+          // build that actually SUCCEEDED but whose row was never marked completed (a graceful stop
+          // landed between the CREATE and markCompleted) — that index is VALID and in use, so dropping
+          // it would tear down a live production index for the whole rebuild window. Probe indisvalid
+          // first; skip the drop for a valid (or absent) index and let the command's IF NOT EXISTS re-run
+          // no-op it and mark the row done.
+          const probeSql = plans.bamHealProbe(this.#config.schema, entry.command)
+          const { rows } = await this.#db.executeSql(probeSql!)
+          if (rows[0]?.invalid) {
+            await this.#db.executeSql(dropSql)
+          }
         }
       }
 
