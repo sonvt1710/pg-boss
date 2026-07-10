@@ -2,12 +2,12 @@ import type { JobMatchStrategy, UpdateQueueOptions, ManagedIndex, ManagedFunctio
 import {
   indexKeysRaw,
   indexPredicateRaw,
+  displayIndexDefinition,
   extractFunctionBody,
-  normalizeFunctionBody,
-  functionName
+  normalizeFunctionBody
 } from './drifter.ts'
 import type { ExpectedColumns, ExpectedConstraints } from './drifter.ts'
-import schemaManifest from './schema-manifest.json' with { type: 'json' }
+import schemaManifest from './schema.json' with { type: 'json' }
 
 export interface SqlQuery {
   text: string
@@ -2748,12 +2748,43 @@ export function getBamEntries (schema: string) {
   `
 }
 
-// --- pg-boss expected schema shape (drift detection) ---
+// --- drift detection: live-catalog probes ---
 //
-// The pg-boss-specific side of drift detection: the expected index/function/column/constraint/enum
-// shape, plus the catalog probes that read partitioning topology from the live database. These feed
-// the generic engine in drifter.ts (which knows nothing about pg-boss). Kept here because they are
-// built directly from the DDL generators above.
+// pg-boss-specific probes that read the live database for drift detection: partitioning topology and
+// in-flight BAM builds. Their results feed the generic engine in drifter.ts, which knows nothing about
+// pg-boss.
+
+// Probe for the default partition; its presence means the partitioned architecture is in use, so
+// drift detection reads it from the live database rather than trusting a boss config flag.
+export function jobCommonExists (schema: string) {
+  return `SELECT to_regclass('${schema}.${COMMON_JOB_TABLE}') as name`
+}
+
+// Per-queue partition tables and their policy, so the expected index set can be computed per table.
+export function getManagedQueuePartitions (schema: string) {
+  return `SELECT table_name as "table", policy FROM ${schema}.queue WHERE partition = true`
+}
+
+// The CREATE INDEX command text of every BAM row not yet completed — used to tell a genuinely-missing
+// index apart from one an async build is still working on (or retrying after a failure).
+export function getIncompleteBamCommands (schema: string) {
+  return `SELECT command FROM ${schema}.bam WHERE status <> 'completed'`
+}
+
+// Extracts the index name a BAM command builds, so an incomplete build can be matched to a missing
+// index. Mirrors the CREATE INDEX shapes bamHealDrop recognises.
+export function bamCommandIndexName (command: string): string | null {
+  const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([\w$]+)"?/i)
+  return match ? match[1] : null
+}
+
+// --- expected schema shape (all derived from the generated manifest) ---
+//
+// The expected tables/columns/constraints/functions/indexes/enum pg-boss compares the live catalog
+// against. Every one is read from schema.json (regenerate with `npm run gen:manifest` after a
+// DDL change) with the placeholder schema substituted back — so nothing here duplicates the DDL as
+// hand-written literals. The only hand-maintained pg-boss knowledge is the per-queue partition index
+// distribution rule just below. These produce the `expected` inputs to drifter.ts's generic diff.
 
 interface QueuePartition {
   table: string
@@ -2774,62 +2805,30 @@ const POLICY_JOB_INDEXES: Record<number, string> = {
 // job_iN indexes with no policy gate — created on every job table regardless of policy
 // (throttle i4, fetch i5, group-concurrency i7, blocking i9).
 const BASE_JOB_INDEXES = [4, 5, 7, 9]
-const ALL_JOB_INDEXES = [1, 2, 3, 4, 5, 6, 7, 8, 9]
-// Static managed indexes that always exist, one per non-job managed table. `ddl` takes the schema so
-// the same builder yields both the schema-agnostic form (for the key/predicate diff) and the real
-// schema-qualified `CREATE INDEX` (for the report's `definition`). These generators already emit the
-// final index name and table, so no partition rewrite is needed.
-const STATIC_MANAGED_INDEXES: ReadonlyArray<{ name: string, table: string, ddl: (schema: string) => string }> = [
-  { name: 'warning_i1', table: 'warning', ddl: createIndexWarning },
-  { name: 'queue_stats_i1', table: 'queue_stats', ddl: (schema: string) => createIndexQueueStats(schema) },
-  { name: 'job_dep_parent_idx', table: 'job_dependency', ddl: createIndexJobDependencyParent }
-]
 
-// The CREATE INDEX DDL builder for each job_iN index, by index number — used to derive the expected
-// key-column list and predicate. job_table_format rewrites only the table and index name for
-// partitions, never the key columns or predicate, so both are a function of the index number alone.
-// (The referenced builders are hoisted function declarations, so this map is safe to initialise here.)
-const JOB_INDEX_DDL: Record<number, (schema: string) => string> = {
-  1: createIndexJobPolicyShort,
-  2: createIndexJobPolicySingleton,
-  3: createIndexJobPolicyStately,
-  4: createIndexJobThrottle,
-  5: createIndexJobFetch,
-  6: createIndexJobPolicyExclusive,
-  7: createIndexJobGroupConcurrency,
-  8: createIndexJobPolicyKeyStrictFifo,
-  9: createIndexJobBlocking
-}
-function jobIndexDdl (n: number, schema = 'x'): string {
-  return JOB_INDEX_DDL[n](schema)
+// The fixed (non-job) managed tables; job/job_common/partitions are handled separately.
+const FIXED_MANAGED_TABLES = ['version', 'queue', 'schedule', 'subscription', 'bam', 'warning', 'queue_stats', 'job_dependency']
+
+// Selects the manifest section for the live architecture, and substitutes the real schema name back in
+// for the placeholder the manifest stores.
+function manifestSection (partitioned: boolean) {
+  return partitioned ? schemaManifest.partitioned : schemaManifest.nonPartitioned
 }
 
-// Rewrites a generic job_iN CREATE INDEX (built against the `job` table) into the physical statement
-// for a specific job table — the shared `job_common`, a per-queue partition, or `job` itself when
-// partitioning is off. This is the TS mirror of the job_table_format() SQL function: `.job` becomes
-// `.<table>` and `job_iN` becomes `<table>_iN`. The `\b`/word-boundary anchors leave `.job_common`,
-// `.job_dependency`, and `job_common` untouched. A no-op when table is 'job'.
-function physicalJobIndexDdl (ddl: string, table: string): string {
-  return ddl
-    .replace(/\.job\b/g, '.' + table)
-    .replace(/\bjob_i(\d+)/g, table + '_i$1')
+function applyManifestSchema (text: string, schema: string): string {
+  return text.split(schemaManifest.schemaToken).join(schema)
 }
 
-// Probe for the default partition; its presence means the partitioned architecture is in use, so
-// drift detection reads it from the live database rather than trusting a boss config flag.
-export function jobCommonExists (schema: string) {
-  return `SELECT to_regclass('${schema}.${COMMON_JOB_TABLE}') as name`
-}
+// The job_state enum values in declaration order, from the manifest (both sections carry the same enum).
+// Order is significant — the numeric base type makes created < retry < … < failed load-bearing.
+export const EXPECTED_JOB_STATES: readonly string[] = schemaManifest.partitioned.enum
 
-// Per-queue partition tables and their policy, so the expected index set can be computed per table.
-export function getManagedQueuePartitions (schema: string) {
-  return `SELECT table_name as "table", policy FROM ${schema}.queue WHERE partition = true`
-}
-
-// The CREATE INDEX command text of every BAM row not yet completed — used to tell a genuinely-missing
-// index apart from one an async build is still working on (or retrying after a failure).
-export function getIncompleteBamCommands (schema: string) {
-  return `SELECT command FROM ${schema}.bam WHERE status <> 'completed'`
+// The tables pg-boss expects to exist. The manifest lists the fixed tables plus job (and job_common in
+// partitioned mode); per-queue partition tables are dynamic, so they are appended from the live set.
+export function expectedManagedTables (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): string[] {
+  const tables = [...manifestSection(partitioned).tables]
+  if (partitioned) for (const p of partitions) tables.push(p.table)
+  return tables
 }
 
 // The columns pg-boss expects on each managed table, taken from the manifest (introspected column type,
@@ -2863,28 +2862,6 @@ export function expectedManagedColumns (schema: string, partitioned: boolean, pa
   return out
 }
 
-// The generated schema manifest (scripts/gen-manifest.ts) is the single source of truth for the
-// fixed-shape expectations — tables, constraints, and the enum — introspected from a fresh schema with
-// the schema name replaced by a placeholder. These no longer duplicate the DDL as hand-written
-// literals: change the CREATE TABLE/TYPE DDL, run `npm run gen:manifest`, and they update automatically.
-const FIXED_MANAGED_TABLES = ['version', 'queue', 'schedule', 'subscription', 'bam', 'warning', 'queue_stats', 'job_dependency']
-
-function manifestSection (partitioned: boolean) {
-  return partitioned ? schemaManifest.partitioned : schemaManifest.nonPartitioned
-}
-
-function applyManifestSchema (text: string, schema: string): string {
-  return text.split(schemaManifest.schemaToken).join(schema)
-}
-
-// The tables pg-boss expects to exist. The manifest lists the fixed tables plus job (and job_common in
-// partitioned mode); per-queue partition tables are dynamic, so they are appended from the live set.
-export function expectedManagedTables (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): string[] {
-  const tables = [...manifestSection(partitioned).tables]
-  if (partitioned) for (const p of partitions) tables.push(p.table)
-  return tables
-}
-
 // The constraints pg-boss expects on each FIXED managed table, taken verbatim from the manifest's
 // pg_get_constraintdef capture (job/job_common/partitions are excluded: their FKs are profile-dependent
 // DEFERRABLE). Compared as a normalized set, so order is irrelevant. The fresh-install integration test
@@ -2900,78 +2877,55 @@ export function expectedManagedConstraints (schema: string, partitioned: boolean
   return [...byTable].map(([table, constraints]) => ({ table, constraints }))
 }
 
-// The job_state enum values in declaration order, from the manifest (both sections carry the same enum).
-// Order is significant — the numeric base type makes created < retry < … < failed load-bearing.
-export const EXPECTED_JOB_STATES: readonly string[] = schemaManifest.partitioned.enum
-
-// The functions pg-boss expects to exist in `schema`. The partitioned architecture adds the three
-// job_table_* helpers and uses the partition-aware create_queue/delete_queue bodies; non-partitioned
-// mode creates neither the helpers nor the partition branches (see create()). Each entry carries the
-// whitespace-normalised body used for the diff and the full statement for remediation.
+// The functions pg-boss expects to exist in `schema`, from the manifest's pg_get_functiondef capture
+// (the partitioned architecture has the three job_table_* helpers plus partition-aware create_queue/
+// delete_queue; non-partitioned mode has neither the helpers nor the partition branches). Each entry
+// carries the whitespace-normalised body used for the diff and the full statement for remediation.
+// Postgres stores a function body verbatim, so the manifest body compares equal to the live one.
 export function expectedManagedFunctions (schema: string, partitioned: boolean): ManagedFunction[] {
-  const defs = partitioned
-    ? [
-        jobTableFormatFunction(schema),
-        jobTableRunFunction(schema),
-        jobTableRunAsyncFunction(schema),
-        createQueueFunction(schema, false),
-        deleteQueueFunction(schema, false)
-      ]
-    : [
-        createQueueFunction(schema, true),
-        deleteQueueFunction(schema, true)
-      ]
-
-  return defs.map(def => ({
-    name: functionName(def),
-    expectedBody: normalizeFunctionBody(extractFunctionBody(def)),
-    definition: def.replace(/\s+/g, ' ').trim()
-  }))
+  return manifestSection(partitioned).functions.map(fn => {
+    const def = applyManifestSchema(fn.def, schema)
+    return {
+      name: fn.name,
+      expectedBody: normalizeFunctionBody(extractFunctionBody(def)),
+      definition: def.replace(/\s+/g, ' ').trim()
+    }
+  })
 }
 
-// Computes the set of indexes pg-boss expects to exist in `schema`. `partitioned` reflects the live
-// database (job_common present ⇒ partitioned architecture), so this needs no boss config. In
-// partitioned mode, job_common carries the full job_iN set and each per-queue partition carries the
-// base set plus its policy index; non-partitioned mode puts the full set directly on `job`.
-// noCoveringIndexes only changes index *definitions*, not names, so it does not affect presence.
-// Each entry's `definition` is the full schema-qualified CREATE INDEX statement, ready to re-run.
+// Computes the set of indexes pg-boss expects to exist in `schema`, sourced from the manifest.
+// `partitioned` reflects the live database (job_common present ⇒ partitioned architecture), so this
+// needs no boss config. The manifest holds every fixed index (the static ones plus the job_iN set on
+// job/job_common); each per-queue partition is dynamic, so its indexes are templated here from the
+// job_common set — the base indexes always, plus the one for the queue's policy. keys/predicate/
+// definition are derived from the catalog-canonical pg_get_indexdef the manifest stores.
 export function expectedManagedIndexes (schema: string, partitioned: boolean, partitions: QueuePartition[] = []): ManagedIndex[] {
-  // genericDdl (schema 'x', `job` table) drives the key/predicate diff; definition is the real
-  // schema-qualified, physically-named statement surfaced for remediation.
-  const entry = (name: string, table: string, genericDdl: string, definition: string): ManagedIndex =>
-    ({ name, table, keys: indexKeysRaw(genericDdl), predicate: indexPredicateRaw(genericDdl), definition })
-  const out: ManagedIndex[] = STATIC_MANAGED_INDEXES.map(i => entry(i.name, i.table, i.ddl('x'), i.ddl(schema)))
-  const jobIndex = (name: string, table: string, n: number): ManagedIndex =>
-    entry(name, table, jobIndexDdl(n), physicalJobIndexDdl(jobIndexDdl(n, schema), table))
-
-  if (!partitioned) {
-    for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`job_i${n}`, 'job', n))
-    return out
+  const managed = (name: string, table: string, indexdef: string): ManagedIndex => {
+    const def = applyManifestSchema(indexdef, schema)
+    return { name, table, keys: indexKeysRaw(def), predicate: indexPredicateRaw(def), definition: displayIndexDefinition(def) }
   }
 
-  for (const n of ALL_JOB_INDEXES) out.push(jobIndex(`${COMMON_JOB_TABLE}_i${n}`, COMMON_JOB_TABLE, n))
+  const jobTable = partitioned ? COMMON_JOB_TABLE : 'job'
+  const out: ManagedIndex[] = []
+  const jobIndexes: Array<{ n: number, def: string }> = []
 
-  for (const p of partitions) {
-    for (const n of BASE_JOB_INDEXES) out.push(jobIndex(`${p.table}_i${n}`, p.table, n))
-    for (const [n, policy] of Object.entries(POLICY_JOB_INDEXES)) {
-      if (p.policy === policy) out.push(jobIndex(`${p.table}_i${Number(n)}`, p.table, Number(n)))
+  // The manifest holds only the managed indexes (constraint-backing *_pkey indexes are excluded at
+  // generation), so every row is an expectation.
+  for (const idx of manifestSection(partitioned).indexes) {
+    out.push(managed(idx.name, idx.table, idx.def))
+    const n = idx.table === jobTable ? idx.name.match(/_i(\d+)$/) : null
+    if (n) jobIndexes.push({ n: Number(n[1]), def: idx.def })
+  }
+
+  // Per-queue partition tables are dynamic, so template each applicable job_common index onto them.
+  if (partitioned) {
+    for (const p of partitions) {
+      for (const { n, def } of jobIndexes) {
+        if (!BASE_JOB_INDEXES.includes(n) && POLICY_JOB_INDEXES[n] !== p.policy) continue
+        out.push(managed(`${p.table}_i${n}`, p.table, def.split(COMMON_JOB_TABLE).join(p.table)))
+      }
     }
   }
 
   return out
-}
-
-// pg-boss names its own indexes `<table>_iN` (or the three static names). A catalog index matching
-// that convention but not in the expected set is drift (e.g. a stale policy index left after a
-// queue's policy changed); anything else is a user's own index and is ignored.
-const MANAGED_INDEX_NAME = /_i\d+$/
-export function isManagedIndexName (name: string): boolean {
-  return MANAGED_INDEX_NAME.test(name) || STATIC_MANAGED_INDEXES.some(i => i.name === name)
-}
-
-// Extracts the index name a BAM command builds, so an incomplete build can be matched to a missing
-// index. Mirrors the CREATE INDEX shapes bamHealDrop recognises.
-export function bamCommandIndexName (command: string): string | null {
-  const match = command.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"?([\w$]+)"?/i)
-  return match ? match[1] : null
 }

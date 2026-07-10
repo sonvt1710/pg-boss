@@ -158,7 +158,8 @@ export function normalizeConstraintDef (def: string): string {
 // pg_index), so it works on CockroachDB/YugabyteDB too.
 export function getSchemaIndexes (schema: string) {
   return `
-    SELECT c.relname AS name, t.relname AS "table", i.indisvalid AS valid, pg_get_indexdef(i.indexrelid) AS def
+    SELECT c.relname AS name, t.relname AS "table", i.indisvalid AS valid, pg_get_indexdef(i.indexrelid) AS def,
+           EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid) AS "constraintBacked"
     FROM pg_index i
     JOIN pg_class c ON c.oid = i.indexrelid
     JOIN pg_class t ON t.oid = i.indrelid
@@ -239,6 +240,8 @@ export interface LiveIndex {
   table: string
   valid: boolean
   def?: string
+  /** True when the index backs a constraint (primary key / unique), so it is not a standalone index. */
+  constraintBacked?: boolean
 }
 
 export interface LiveFunction {
@@ -390,16 +393,13 @@ function computeEnumDrift (name: string, expected: readonly string[], actual: st
 // convention test/pgSchemaHelper.ts encodes — index column ORDER is significant here (an index on
 // (a, b) differs from (b, a)); the table-column diff instead normalises ordinal position away.
 //
-// Generic engine: it carries no pg-boss knowledge. The caller supplies `building` (index names an
-// async build is still working on, pulled out of "missing"), `isManaged` (decides which stray live
-// index names count as "unexpected"), and opt-in function/column/enum/constraint checks. Each of those
-// is best-effort — callers omit them on backends that lack the relevant catalog support.
+// Generic engine: it carries no pg-boss knowledge. Every dimension is one optional `{ expected, live }`
+// entry — none is privileged. `indexes.building` names async builds still in progress (pulled out of
+// "missing"); `tables.expected` is the managed table set that scopes the extra-index warning. Each
+// dimension is best-effort — callers omit the ones a backend can't support.
 export function computeSchemaDrift (
-  expectedIndexes: ManagedIndex[],
-  liveIndexes: LiveIndex[],
   opts: {
-    building?: ReadonlySet<string>
-    isManaged?: (name: string) => boolean
+    indexes?: { expected: ManagedIndex[], live: LiveIndex[], building?: ReadonlySet<string> }
     tables?: { expected: string[], live: string[] }
     functions?: { expected: ManagedFunction[], live: LiveFunction[] }
     columns?: { expected: ExpectedColumns[], live: LiveColumn[] }
@@ -407,8 +407,9 @@ export function computeSchemaDrift (
     constraints?: { expected: ExpectedConstraints[], live: LiveConstraint[] }
   } = {}
 ): SchemaDriftReport {
-  const building = opts.building ?? new Set<string>()
-  const isManaged = opts.isManaged ?? (() => false)
+  const expectedIndexes = opts.indexes?.expected ?? []
+  const liveIndexes = opts.indexes?.live ?? []
+  const building = opts.indexes?.building ?? new Set<string>()
 
   const liveByName = new Map(liveIndexes.map(i => [i.name, i]))
   const expectedNames = new Set(expectedIndexes.map(i => i.name))
@@ -445,8 +446,13 @@ export function computeSchemaDrift (
     }
   }
 
-  const unexpected = liveIndexes
-    .filter(i => !expectedNames.has(i.name) && isManaged(i.name))
+  // Extra indexes: standalone (non-constraint-backing) indexes on a managed table that the expected set
+  // does not account for — a stale pg-boss index or one a user added. These are informational (an extra
+  // index is harmless), so they are surfaced as a warning and do NOT flip `ok`. Scoped to managed tables
+  // so a user's indexes on their own tables in the schema are never reported.
+  const managedTables = new Set(opts.tables?.expected ?? expectedIndexes.map(i => i.table))
+  const extraIndexes = liveIndexes
+    .filter(i => managedTables.has(i.table) && !expectedNames.has(i.name) && !i.constraintBacked)
     .map(i => ({ name: i.name, table: i.table }))
 
   const liveTables = new Set(opts.tables?.live ?? [])
@@ -460,14 +466,14 @@ export function computeSchemaDrift (
   const enumDrift = opts.enum ? computeEnumDrift(opts.enum.name, opts.enum.expected, opts.enum.actual) : null
 
   return {
-    ok: missingTables.length === 0 && missing.length === 0 && invalid.length === 0 && unexpected.length === 0 &&
+    ok: missingTables.length === 0 && missing.length === 0 && invalid.length === 0 &&
       mismatched.length === 0 && missingFunctions.length === 0 && mismatchedFunctions.length === 0 &&
       columnDrift.length === 0 && constraintDrift.length === 0 && enumDrift === null,
     missingTables,
     missing,
     building: stillBuilding,
     invalid,
-    unexpected,
+    extraIndexes,
     mismatched,
     missingFunctions,
     mismatchedFunctions,

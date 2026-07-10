@@ -1055,12 +1055,6 @@
     ],
     "indexes": [
       {
-        "name": "bam_pkey",
-        "table": "bam",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX bam_pkey ON {{schema}}.bam USING btree (id)"
-      },
-      {
         "name": "job_common_i1",
         "table": "job_common",
         "valid": true,
@@ -1115,28 +1109,10 @@
         "def": "CREATE INDEX job_common_i9 ON {{schema}}.job_common USING btree (name, id) WHERE (blocking AND (state = 'completed'::{{schema}}.job_state))"
       },
       {
-        "name": "job_common_pkey",
-        "table": "job_common",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX job_common_pkey ON {{schema}}.job_common USING btree (name, id)"
-      },
-      {
         "name": "job_dep_parent_idx",
         "table": "job_dependency",
         "valid": true,
         "def": "CREATE INDEX job_dep_parent_idx ON {{schema}}.job_dependency USING btree (parent_name, parent_id)"
-      },
-      {
-        "name": "job_dependency_pkey",
-        "table": "job_dependency",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX job_dependency_pkey ON {{schema}}.job_dependency USING btree (child_name, child_id, parent_name, parent_id)"
-      },
-      {
-        "name": "job_pkey",
-        "table": "job",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX job_pkey ON ONLY {{schema}}.job USING btree (name, id)"
       },
       {
         "name": "queue_stats_i1",
@@ -1145,46 +1121,10 @@
         "def": "CREATE INDEX queue_stats_i1 ON ONLY {{schema}}.queue_stats USING btree (name, captured_on DESC) INCLUDE (deferred_count, queued_count, ready_count, active_count, failed_count, total_count)"
       },
       {
-        "name": "queue_stats_pkey",
-        "table": "queue_stats",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX queue_stats_pkey ON ONLY {{schema}}.queue_stats USING btree (id, captured_on)"
-      },
-      {
-        "name": "queue_pkey",
-        "table": "queue",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX queue_pkey ON {{schema}}.queue USING btree (name)"
-      },
-      {
-        "name": "schedule_pkey",
-        "table": "schedule",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX schedule_pkey ON {{schema}}.schedule USING btree (name, key)"
-      },
-      {
-        "name": "subscription_pkey",
-        "table": "subscription",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX subscription_pkey ON {{schema}}.subscription USING btree (event, name)"
-      },
-      {
-        "name": "version_pkey",
-        "table": "version",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX version_pkey ON {{schema}}.version USING btree (version)"
-      },
-      {
         "name": "warning_i1",
         "table": "warning",
         "valid": true,
         "def": "CREATE INDEX warning_i1 ON {{schema}}.warning USING btree (created_on DESC)"
-      },
-      {
-        "name": "warning_pkey",
-        "table": "warning",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX warning_pkey ON {{schema}}.warning USING btree (id)"
       }
     ],
     "functions": [
@@ -2035,22 +1975,10 @@
     ],
     "indexes": [
       {
-        "name": "bam_pkey",
-        "table": "bam",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX bam_pkey ON {{schema}}.bam USING btree (id)"
-      },
-      {
         "name": "job_dep_parent_idx",
         "table": "job_dependency",
         "valid": true,
         "def": "CREATE INDEX job_dep_parent_idx ON {{schema}}.job_dependency USING btree (parent_name, parent_id)"
-      },
-      {
-        "name": "job_dependency_pkey",
-        "table": "job_dependency",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX job_dependency_pkey ON {{schema}}.job_dependency USING btree (child_name, child_id, parent_name, parent_id)"
       },
       {
         "name": "job_i1",
@@ -2107,58 +2035,16 @@
         "def": "CREATE INDEX job_i9 ON {{schema}}.job USING btree (name, id) WHERE (blocking AND (state = 'completed'::{{schema}}.job_state))"
       },
       {
-        "name": "job_pkey",
-        "table": "job",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX job_pkey ON {{schema}}.job USING btree (name, id)"
-      },
-      {
         "name": "queue_stats_i1",
         "table": "queue_stats",
         "valid": true,
         "def": "CREATE INDEX queue_stats_i1 ON {{schema}}.queue_stats USING btree (name, captured_on DESC) INCLUDE (deferred_count, queued_count, ready_count, active_count, failed_count, total_count)"
       },
       {
-        "name": "queue_stats_pkey",
-        "table": "queue_stats",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX queue_stats_pkey ON {{schema}}.queue_stats USING btree (id)"
-      },
-      {
-        "name": "queue_pkey",
-        "table": "queue",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX queue_pkey ON {{schema}}.queue USING btree (name)"
-      },
-      {
-        "name": "schedule_pkey",
-        "table": "schedule",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX schedule_pkey ON {{schema}}.schedule USING btree (name, key)"
-      },
-      {
-        "name": "subscription_pkey",
-        "table": "subscription",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX subscription_pkey ON {{schema}}.subscription USING btree (event, name)"
-      },
-      {
-        "name": "version_pkey",
-        "table": "version",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX version_pkey ON {{schema}}.version USING btree (version)"
-      },
-      {
         "name": "warning_i1",
         "table": "warning",
         "valid": true,
         "def": "CREATE INDEX warning_i1 ON {{schema}}.warning USING btree (created_on DESC)"
-      },
-      {
-        "name": "warning_pkey",
-        "table": "warning",
-        "valid": true,
-        "def": "CREATE UNIQUE INDEX warning_pkey ON {{schema}}.warning USING btree (id)"
       }
     ],
     "functions": [

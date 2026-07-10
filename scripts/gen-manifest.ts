@@ -1,4 +1,4 @@
-// Generates src/schema-manifest.json: the canonical, catalog-introspected shape of a freshly created
+// Generates src/schema.json: the canonical, catalog-introspected shape of a freshly created
 // pg-boss schema, for both the partitioned and non-partitioned architectures. The drift check compares
 // the live database against this manifest, so the CREATE TABLE/FUNCTION/INDEX DDL in plans.ts is the
 // single source of truth — the manifest is a generated artifact, never hand-edited.
@@ -42,7 +42,11 @@ async function introspect (pg: PGlite) {
   const drop = <T extends { table: string }>(rows: T[]) => rows.filter(r => !isDynamicPartition(r.table))
   const columns = drop(await q(pg, drifter.getSchemaColumns(GEN_SCHEMA)))
   const constraints = drop(await q(pg, drifter.getSchemaConstraints(GEN_SCHEMA)))
+  // Only the standalone managed indexes are expectations; constraint-backing indexes (*_pkey) are
+  // covered by the constraint check, and their `constraintBacked` flag is dropped from the stored rows.
   const indexes = drop(await q(pg, drifter.getSchemaIndexes(GEN_SCHEMA)))
+    .filter(r => !r.constraintBacked)
+    .map(({ name, table, valid, def }) => ({ name, table, valid, def }))
   const functions = await q(pg, drifter.getSchemaFunctions(GEN_SCHEMA))
   const enumLabels = (await q(pg, drifter.getEnumDefinition(GEN_SCHEMA))).map(r => r.label as string)
   const tables = [...new Set(columns.map(c => c.table as string))]
@@ -88,7 +92,7 @@ const manifest = {
   nonPartitioned: await buildFor(false)
 }
 
-const outPath = resolve(dirname(fileURLToPath(import.meta.url)), '../src/schema-manifest.json')
+const outPath = resolve(dirname(fileURLToPath(import.meta.url)), '../src/schema.json')
 const serialized = JSON.stringify(manifest, null, 2) + '\n'
 
 // `--check` (used by CI / pretest) verifies the committed manifest matches what the current DDL would

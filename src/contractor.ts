@@ -71,11 +71,12 @@ class Contractor {
       : []
 
     const liveResult = await this.db.executeSql(drifter.getSchemaIndexes(schema))
-    const live = liveResult.rows.map((r: { name: string, table: string, valid: boolean, def: string }) => ({
+    const live = liveResult.rows.map((r: { name: string, table: string, valid: boolean, def: string, constraintBacked: boolean }) => ({
       name: r.name,
       table: r.table,
       valid: r.valid,
-      def: r.def
+      def: r.def,
+      constraintBacked: r.constraintBacked
     }))
 
     // The bam table only exists from schema v27; ignore its absence on very old schemas.
@@ -132,10 +133,8 @@ class Contractor {
     const expectedColumns = plans.expectedManagedColumns(schema, partitioned, partitions)
       .map(c => canonicalPg ? c : { table: c.table, columns: c.columns })
 
-    const expected = plans.expectedManagedIndexes(schema, partitioned, partitions)
-    return drifter.computeSchemaDrift(expected, live, {
-      building,
-      isManaged: plans.isManagedIndexName,
+    return drifter.computeSchemaDrift({
+      indexes: { expected: plans.expectedManagedIndexes(schema, partitioned, partitions), live, building },
       tables: { expected: plans.expectedManagedTables(schema, partitioned, partitions), live: [...new Set(liveColumns.map(c => c.table))] },
       functions: { expected: plans.expectedManagedFunctions(schema, partitioned), live: liveFunctions },
       columns: { expected: expectedColumns, live: liveColumns },

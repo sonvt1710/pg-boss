@@ -1050,8 +1050,8 @@ export interface EnumDrift {
  * differs from what the code emits).
  */
 export interface SchemaDriftReport {
-  /** True when nothing is missing, invalid, unexpected, mismatched, or drifted (tables, columns,
-   *  defaults, types, constraints, enum) — schema matches the code. */
+  /** True when nothing is missing, invalid, mismatched, or drifted (tables, columns, defaults, types,
+   *  constraints, enum). `extraIndexes` is informational and does NOT affect this. */
   ok: boolean
   /** Expected managed tables with no matching catalog table. */
   missingTables: string[]
@@ -1061,8 +1061,12 @@ export interface SchemaDriftReport {
   building: ManagedIndex[]
   /** Present indexes marked INVALID (interrupted CREATE INDEX CONCURRENTLY). */
   invalid: InvalidIndex[]
-  /** Present indexes matching pg-boss's `_iN` naming that the expected set does not account for. */
-  unexpected: ManagedIndex[]
+  /**
+   * Standalone (non-constraint-backing) indexes present on a managed table that the expected set does
+   * not account for — a stale pg-boss index or one a user added. Informational only: an extra index is
+   * harmless, so this is surfaced as a warning and does not make the schema "not ok".
+   */
+  extraIndexes: Array<{ name: string, table: string }>
   /** Present indexes whose key columns/order differ from the expected definition. */
   mismatched: MismatchedIndex[]
   /** Expected functions with no matching catalog entry. */

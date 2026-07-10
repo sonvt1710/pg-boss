@@ -435,10 +435,8 @@ async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> 
 
     const building = new Set(bamCommands.map(plans.bamCommandIndexName).filter((n): n is string => n !== null))
 
-    const expected = plans.expectedManagedIndexes(schema, partitioned, partitions)
-    const report = drifter.computeSchemaDrift(expected, live, {
-      building,
-      isManaged: plans.isManagedIndexName,
+    const report = drifter.computeSchemaDrift({
+      indexes: { expected: plans.expectedManagedIndexes(schema, partitioned, partitions), live, building },
       tables: { expected: plans.expectedManagedTables(schema, partitioned, partitions), live: [...new Set(liveColumns.map(c => c.table))] },
       functions: { expected: plans.expectedManagedFunctions(schema, partitioned), live: liveFunctions },
       columns: { expected: plans.expectedManagedColumns(schema, partitioned, partitions), live: liveColumns },
@@ -449,6 +447,13 @@ async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> 
     if (report.building.length) {
       console.log(`\nBuilding (async index build in progress — not yet drift) (${report.building.length}):`)
       for (const i of report.building) console.log(`  ${i.table}.${i.name}`)
+    }
+
+    // Extra indexes are informational (a stale pg-boss index or a user-added one) — a warning, not
+    // drift. Printed regardless of overall status; it never changes the exit code.
+    if (report.extraIndexes.length) {
+      console.log(`\n⚠ EXTRA INDEXES (present on a managed table but not expected — harmless) (${report.extraIndexes.length}):`)
+      for (const i of report.extraIndexes) console.log(`  ${i.table}.${i.name}`)
     }
 
     if (report.ok) {
@@ -479,11 +484,6 @@ async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> 
         console.log(`  ${i.table}.${i.name}`)
         if (i.definition) console.log(`    rebuild: ${i.definition}`)
       }
-    }
-
-    if (report.unexpected.length) {
-      console.log(`\nUNEXPECTED (pg-boss-named index not in the expected set) (${report.unexpected.length}):`)
-      for (const i of report.unexpected) console.log(`  ${i.table}.${i.name}`)
     }
 
     if (report.mismatched.length) {

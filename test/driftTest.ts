@@ -55,7 +55,8 @@ describe('drift', function () {
       expect(byName.get('job_common_i5')!.keys).toBe('name, start_after')
       expect(byName.get('job_common_i9')!.keys).toBe('name, id')
       expect(byName.get('job_common_i1')!.keys).toBe("name, COALESCE(singleton_key, '')")
-      expect(byName.get('job_common_i9')!.predicate).toBe("blocking AND state = 'completed'")
+      // predicate is the catalog-canonical pg_get_indexdef form (per-conjunct parens)
+      expect(byName.get('job_common_i9')!.predicate).toBe("blocking AND (state = 'completed')")
     })
 
     it('attaches the full schema-qualified, physically-named CREATE INDEX definition', function () {
@@ -64,13 +65,13 @@ describe('drift', function () {
       )
       // shared partition: name and table rewritten from job_iN/job to job_common
       expect(byName.get('job_common_i9')!.definition)
-        .toBe("CREATE INDEX job_common_i9 ON myschema.job_common (name, id) WHERE blocking AND state = 'completed'")
+        .toBe("CREATE INDEX job_common_i9 ON myschema.job_common (name, id) WHERE blocking AND (state = 'completed')")
       // UNIQUE and the predicate are preserved
       expect(byName.get('job_common_i1')!.definition)
-        .toBe("CREATE UNIQUE INDEX job_common_i1 ON myschema.job_common (name, COALESCE(singleton_key, '')) WHERE state = 'created' AND policy = 'short'")
+        .toBe("CREATE UNIQUE INDEX job_common_i1 ON myschema.job_common (name, COALESCE(singleton_key, '')) WHERE (state = 'created') AND (policy = 'short')")
       // per-queue partition keeps its own physical name and table
       expect(byName.get('jabc_i5')!.definition)
-        .toBe("CREATE INDEX jabc_i5 ON myschema.jabc (name, start_after) WHERE state < 'active' AND NOT blocked")
+        .toBe("CREATE INDEX jabc_i5 ON myschema.jabc (name, start_after) WHERE (state < 'active') AND (NOT blocked)")
       // static index needs no partition rewrite
       expect(byName.get('warning_i1')!.definition)
         .toBe('CREATE INDEX warning_i1 ON myschema.warning (created_on DESC)')
@@ -102,21 +103,21 @@ describe('drift', function () {
         { name: 'job_common_i5', table: 'job_common', valid: true },
         { name: 'warning_i1', table: 'warning', valid: true }
       ]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.ok).toBe(true)
       expect(report.missing).toHaveLength(0)
     })
 
     it('flags a missing index', function () {
       const live = [{ name: 'warning_i1', table: 'warning', valid: true }]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.ok).toBe(false)
       expect(report.missing.map(i => i.name)).toEqual(['job_common_i5'])
     })
 
     it('treats a missing index with an incomplete BAM build as building, not missing', function () {
       const live = [{ name: 'warning_i1', table: 'warning', valid: true }]
-      const report = drifter.computeSchemaDrift(expected, live, { building: new Set(['job_common_i5']) })
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live, building: new Set(['job_common_i5']) } })
       expect(report.missing).toHaveLength(0)
       expect(report.building.map(i => i.name)).toEqual(['job_common_i5'])
       // building alone is not drift
@@ -128,20 +129,23 @@ describe('drift', function () {
         { name: 'job_common_i5', table: 'job_common', valid: false, def: 'CREATE INDEX job_common_i5 ON pgboss.job_common USING btree (name, start_after)' },
         { name: 'warning_i1', table: 'warning', valid: true }
       ]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.ok).toBe(false)
       expect(report.invalid.map(i => i.name)).toEqual(['job_common_i5'])
     })
 
-    it('flags an unexpected pg-boss-named index but ignores user indexes', function () {
+    it('reports non-constraint indexes on a managed table that are not expected as extra (a warning)', function () {
       const live = [
         { name: 'job_common_i5', table: 'job_common', valid: true },
         { name: 'warning_i1', table: 'warning', valid: true },
-        { name: 'job_common_i99', table: 'job_common', valid: true }, // stale managed-named
-        { name: 'my_custom_lookup', table: 'job_common', valid: true } // user's own
+        { name: 'job_common_i99', table: 'job_common', valid: true }, // stale pg-boss-named
+        { name: 'my_custom_lookup', table: 'job_common', valid: true }, // user's own
+        { name: 'job_common_pkey', table: 'job_common', valid: true, constraintBacked: true }, // pk index, ignored
+        { name: 'their_idx', table: 'their_table', valid: true } // not a managed table, ignored
       ]
-      const report = drifter.computeSchemaDrift(expected, live, { isManaged: plans.isManagedIndexName })
-      expect(report.unexpected.map(i => i.name)).toEqual(['job_common_i99'])
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
+      expect(report.extraIndexes.map(i => i.name).sort()).toEqual(['job_common_i99', 'my_custom_lookup'])
+      expect(report.ok).toBe(true) // extra indexes are informational, not drift
     })
   })
 
@@ -235,14 +239,14 @@ describe('drift', function () {
 
     it('reports ok when keys and predicate match', function () {
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: true, def: "CREATE INDEX job_common_i9 ON pgboss.job_common USING btree (name, id) WHERE (blocking AND (state = 'completed'::pgboss.job_state))" }]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.ok).toBe(true)
       expect(report.mismatched).toHaveLength(0)
     })
 
     it('flags an index whose key columns are reordered', function () {
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: true, def: "CREATE INDEX job_common_i9 ON pgboss.job_common USING btree (id, name) WHERE (blocking AND (state = 'completed'::pgboss.job_state))" }]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.ok).toBe(false)
       expect(report.mismatched).toHaveLength(1)
       expect(report.mismatched[0]).toMatchObject({ name: 'job_common_i9', actualKeys: 'id, name', differs: ['keys'] })
@@ -250,7 +254,7 @@ describe('drift', function () {
 
     it('flags an index whose predicate differs', function () {
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: true, def: "CREATE INDEX job_common_i9 ON pgboss.job_common USING btree (name, id) WHERE (blocking AND (state = 'active'::pgboss.job_state))" }]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.ok).toBe(false)
       expect(report.mismatched[0].differs).toEqual(['predicate'])
       expect(report.mismatched[0].actualPredicate).toBe("blocking AND (state = 'active')")
@@ -258,20 +262,20 @@ describe('drift', function () {
 
     it('flags an index whose keys AND predicate both differ', function () {
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: true, def: "CREATE INDEX job_common_i9 ON pgboss.job_common USING btree (id, name) WHERE (blocking AND (state = 'active'::pgboss.job_state))" }]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.mismatched[0].differs).toEqual(['keys', 'predicate'])
     })
 
     it('does not flag when the live def is unparseable', function () {
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: true, def: 'garbage' }]
-      const report = drifter.computeSchemaDrift(expected, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live } })
       expect(report.mismatched).toHaveLength(0)
     })
 
     it('treats an expected index without a predicate as non-partial', function () {
       const noPredicate = [{ name: 'x_i1', table: 't', keys: 'a' }]
       const live = [{ name: 'x_i1', table: 't', valid: true, def: 'CREATE INDEX x_i1 ON s.t USING btree (a)' }]
-      const report = drifter.computeSchemaDrift(noPredicate, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected: noPredicate, live } })
       expect(report.ok).toBe(true)
       expect(report.mismatched).toHaveLength(0)
     })
@@ -279,23 +283,26 @@ describe('drift', function () {
     it('skips the definition-diff for an expected index without a known key list', function () {
       const noKeys = [{ name: 'job_common_i9', table: 'job_common' }]
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: true, def: 'CREATE INDEX job_common_i9 ON pgboss.job_common USING btree (id, name)' }]
-      const report = drifter.computeSchemaDrift(noKeys, live)
+      const report = drifter.computeSchemaDrift({ indexes: { expected: noKeys, live } })
       expect(report.ok).toBe(true)
       expect(report.mismatched).toHaveLength(0)
     })
 
     it('reports an invalid index that a BAM row is rebuilding as building', function () {
       const live = [{ name: 'job_common_i9', table: 'job_common', valid: false }]
-      const report = drifter.computeSchemaDrift(expected, live, { building: new Set(['job_common_i9']) })
+      const report = drifter.computeSchemaDrift({ indexes: { expected, live, building: new Set(['job_common_i9']) } })
       expect(report.invalid).toHaveLength(1)
       expect(report.invalid[0].building).toBe(true)
     })
 
-    it('flags an unexpected index whose name matches a static managed name', function () {
-      // job_dep_parent_idx does not match the _iN pattern, so this exercises the static-name branch.
-      const live = [{ name: 'job_dep_parent_idx', table: 'job_dependency', valid: true, def: '' }]
-      const report = drifter.computeSchemaDrift([], live, { isManaged: plans.isManagedIndexName })
-      expect(report.unexpected.map(i => i.name)).toEqual(['job_dep_parent_idx'])
+    it('scopes extra indexes to managed tables from tables.expected', function () {
+      const live = [
+        { name: 'stray_idx', table: 'queue', valid: true }, // on a managed table -> extra
+        { name: 'user_idx', table: 'their_table', valid: true } // not a managed table -> ignored
+      ]
+      const report = drifter.computeSchemaDrift({ indexes: { expected: [], live }, tables: { expected: ['queue'], live: ['queue', 'their_table'] } })
+      expect(report.extraIndexes.map(i => i.name)).toEqual(['stray_idx'])
+      expect(report.ok).toBe(true)
     })
   })
 
@@ -334,12 +341,12 @@ describe('drift', function () {
 
   describe('expectedManagedFunctions (pure)', function () {
     it('partitioned mode expects the job_table_* helpers plus queue functions', function () {
-      const names = plans.expectedManagedFunctions('pgboss', true).map(f => f.name)
-      expect(names).toEqual(['job_table_format', 'job_table_run', 'job_table_run_async', 'create_queue', 'delete_queue'])
+      const names = plans.expectedManagedFunctions('pgboss', true).map(f => f.name).sort()
+      expect(names).toEqual(['create_queue', 'delete_queue', 'job_table_format', 'job_table_run', 'job_table_run_async'])
     })
 
     it('non-partitioned mode expects only the queue functions', function () {
-      const names = plans.expectedManagedFunctions('pgboss', false).map(f => f.name)
+      const names = plans.expectedManagedFunctions('pgboss', false).map(f => f.name).sort()
       expect(names).toEqual(['create_queue', 'delete_queue'])
     })
   })
@@ -358,7 +365,7 @@ describe('drift', function () {
     })
 
     it('flags a missing column', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'queue', columns: ['name', 'policy', 'notify'] }],
           live: [{ table: 'queue', column: 'name' }, { table: 'queue', column: 'policy' }]
@@ -369,7 +376,7 @@ describe('drift', function () {
     })
 
     it('flags an unexpected column', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'queue', columns: ['name'] }],
           live: [{ table: 'queue', column: 'name' }, { table: 'queue', column: 'legacy_flag' }]
@@ -380,7 +387,7 @@ describe('drift', function () {
     })
 
     it('skips a managed table that has no live columns (absent table)', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'bam', columns: ['id', 'name'] }],
           live: []
@@ -391,7 +398,7 @@ describe('drift', function () {
     })
 
     it('reports ok when columns match', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'queue', columns: ['name', 'policy'] }],
           live: [{ table: 'queue', column: 'policy' }, { table: 'queue', column: 'name' }]
@@ -411,14 +418,14 @@ describe('drift', function () {
     const funcs = plans.expectedManagedFunctions('pgboss', false)
 
     it('reports ok when every function body matches', function () {
-      const report = drifter.computeSchemaDrift([], [], { functions: { expected: funcs, live: funcs.map(asLive) } })
+      const report = drifter.computeSchemaDrift({ functions: { expected: funcs, live: funcs.map(asLive) } })
       expect(report.missingFunctions).toHaveLength(0)
       expect(report.mismatchedFunctions).toHaveLength(0)
       expect(report.ok).toBe(true)
     })
 
     it('flags an absent function as missing', function () {
-      const report = drifter.computeSchemaDrift([], [], { functions: { expected: funcs, live: [asLive(funcs[0])] } })
+      const report = drifter.computeSchemaDrift({ functions: { expected: funcs, live: [asLive(funcs[0])] } })
       expect(report.missingFunctions.map(f => f.name)).toEqual(['delete_queue'])
       expect(report.ok).toBe(false)
     })
@@ -426,14 +433,14 @@ describe('drift', function () {
     it('flags a function whose body differs as mismatched', function () {
       const live = funcs.map(asLive)
       live[0].def = live[0].def.replace('$function$', '$function$ /* tampered */')
-      const report = drifter.computeSchemaDrift([], [], { functions: { expected: funcs, live } })
+      const report = drifter.computeSchemaDrift({ functions: { expected: funcs, live } })
       expect(report.mismatchedFunctions.map(f => f.name)).toEqual(['create_queue'])
       expect(report.mismatchedFunctions[0].actualBody).toContain('tampered')
       expect(report.ok).toBe(false)
     })
 
     it('does not flag a function whose body cannot be extracted', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         functions: {
           expected: funcs,
           live: funcs.map(f => ({ name: f.name, def: `CREATE FUNCTION pgboss.${f.name}() RETURNS void LANGUAGE sql` }))
@@ -444,7 +451,7 @@ describe('drift', function () {
     })
 
     it('reports no enum drift when values and order match', function () {
-      const report = drifter.computeSchemaDrift([], [], { enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: [...plans.EXPECTED_JOB_STATES] } })
+      const report = drifter.computeSchemaDrift({ enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: [...plans.EXPECTED_JOB_STATES] } })
       expect(report.enumDrift).toBeNull()
       expect(report.ok).toBe(true)
     })
@@ -452,20 +459,20 @@ describe('drift', function () {
     it('flags a reordered enum as drift', function () {
       const reordered = [...plans.EXPECTED_JOB_STATES]
       ;[reordered[1], reordered[2]] = [reordered[2], reordered[1]]
-      const report = drifter.computeSchemaDrift([], [], { enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: reordered } })
+      const report = drifter.computeSchemaDrift({ enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: reordered } })
       expect(report.enumDrift).toBeTruthy()
       expect(report.enumDrift!.actualValues).toEqual(reordered)
       expect(report.ok).toBe(false)
     })
 
     it('flags an added enum value as drift', function () {
-      const report = drifter.computeSchemaDrift([], [], { enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: [...plans.EXPECTED_JOB_STATES, 'archived'] } })
+      const report = drifter.computeSchemaDrift({ enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: [...plans.EXPECTED_JOB_STATES, 'archived'] } })
       expect(report.enumDrift!.actualValues).toContain('archived')
       expect(report.ok).toBe(false)
     })
 
     it('treats an absent enum (empty actual) as not-drift', function () {
-      const report = drifter.computeSchemaDrift([], [], { enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: [] } })
+      const report = drifter.computeSchemaDrift({ enum: { name: 'job_state', expected: plans.EXPECTED_JOB_STATES, actual: [] } })
       expect(report.enumDrift).toBeNull()
       expect(report.ok).toBe(true)
     })
@@ -487,7 +494,7 @@ describe('drift', function () {
     })
 
     it('computeConstraintDrift flags a missing constraint', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         constraints: {
           expected: [{ table: 'queue', constraints: ['PRIMARY KEY (name)', 'CHECK ((dead_letter IS DISTINCT FROM name))'] }],
           live: [{ table: 'queue', def: 'PRIMARY KEY (name)' }]
@@ -498,7 +505,7 @@ describe('drift', function () {
     })
 
     it('computeConstraintDrift flags an unexpected constraint', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         constraints: {
           expected: [{ table: 'warning', constraints: ['PRIMARY KEY (id)'] }],
           live: [{ table: 'warning', def: 'PRIMARY KEY (id)' }, { table: 'warning', def: "CHECK ((type <> ''::text))" }]
@@ -509,7 +516,7 @@ describe('drift', function () {
     })
 
     it('computeConstraintDrift reports ok when the constraint set matches (modulo casts/quotes)', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         constraints: {
           expected: [{ table: 'queue', constraints: ['CHECK ((dead_letter IS DISTINCT FROM name))'] }],
           live: [{ table: 'queue', def: 'CHECK ((dead_letter IS DISTINCT FROM name))' }]
@@ -520,7 +527,7 @@ describe('drift', function () {
     })
 
     it('computeConstraintDrift skips a table with no live constraints (absent table)', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         constraints: {
           expected: [{ table: 'bam', constraints: ['PRIMARY KEY (id)'] }],
           live: []
@@ -531,7 +538,7 @@ describe('drift', function () {
     })
 
     it('flags a column whose default differs as default drift', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'queue', columns: ['notify'], defaults: { notify: 'false' } }],
           live: [{ table: 'queue', column: 'notify', default: 'true' }]
@@ -543,7 +550,7 @@ describe('drift', function () {
     })
 
     it('reports no default drift when the default matches modulo casts', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'queue', columns: ['policy'], defaults: { policy: "'standard'" } }],
           live: [{ table: 'queue', column: 'policy', default: "'standard'::text" }]
@@ -556,7 +563,7 @@ describe('drift', function () {
 
   describe('column type / nullability + table presence (pure)', function () {
     it('flags a column type mismatch', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'queue', columns: ['retry_limit'], types: { retry_limit: { type: 'integer', notNull: true } } }],
           live: [{ table: 'queue', column: 'retry_limit', type: 'bigint', notNull: true }]
@@ -567,7 +574,7 @@ describe('drift', function () {
     })
 
     it('flags a nullability mismatch', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'queue', columns: ['policy'], types: { policy: { type: 'text', notNull: true } } }],
           live: [{ table: 'queue', column: 'policy', type: 'text', notNull: false }]
@@ -578,7 +585,7 @@ describe('drift', function () {
     })
 
     it('does not flag type/nullability when the expected table carries no types map', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'job', columns: ['state'] }],
           live: [{ table: 'job', column: 'state', type: 'pgboss.job_state', notNull: true }]
@@ -589,7 +596,7 @@ describe('drift', function () {
     })
 
     it('flags a missing table', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         tables: { expected: ['queue', 'warning', 'bam'], live: ['queue', 'warning'] }
       })
       expect(report.missingTables).toEqual(['bam'])
@@ -597,7 +604,7 @@ describe('drift', function () {
     })
 
     it('reports no missing tables when all are present', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         tables: { expected: ['queue', 'warning'], live: ['queue', 'warning', 'user_table'] }
       })
       expect(report.missingTables).toEqual([])
@@ -605,7 +612,7 @@ describe('drift', function () {
     })
 
     it('treats a live column with no type as an empty actual type', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'q', columns: ['x'], types: { x: { type: 'integer', notNull: false } } }],
           live: [{ table: 'q', column: 'x', notNull: false }]
@@ -633,7 +640,7 @@ describe('drift', function () {
     })
 
     it('treats a live column with a null default as an empty default', function () {
-      const report = drifter.computeSchemaDrift([], [], {
+      const report = drifter.computeSchemaDrift({
         columns: {
           expected: [{ table: 'q', columns: ['x'], defaults: { x: '0' } }],
           live: [{ table: 'q', column: 'x', default: null }]
@@ -642,9 +649,10 @@ describe('drift', function () {
       expect(report.columnDrift[0].defaultMismatches).toEqual([{ column: 'x', expected: '0', actual: '' }])
     })
 
-    it('flags no unexpected index when no isManaged predicate is supplied', function () {
-      const report = drifter.computeSchemaDrift([], [{ name: 'stray_i9', table: 't', valid: true }], {})
-      expect(report.unexpected).toEqual([])
+    it('does not report an extra index on a table outside the managed set', function () {
+      const report = drifter.computeSchemaDrift({ indexes: { expected: [], live: [{ name: 'stray_i9', table: 't', valid: true }] } })
+      expect(report.extraIndexes).toEqual([])
+      expect(report.ok).toBe(true)
     })
   })
 
@@ -655,7 +663,7 @@ describe('drift', function () {
       expect(report.ok).toBe(true)
       expect(report.missing).toHaveLength(0)
       expect(report.invalid).toHaveLength(0)
-      expect(report.unexpected).toHaveLength(0)
+      expect(report.extraIndexes).toHaveLength(0)
       expect(report.columnDrift).toHaveLength(0)
       expect(report.constraintDrift).toHaveLength(0)
     })
@@ -675,7 +683,7 @@ describe('drift', function () {
       expect(report.missing.map(i => i.name)).toContain(`${table}_i5`)
       // the report carries the exact DDL to recreate it, schema-qualified
       const m = report.missing.find(i => i.name === `${table}_i5`)!
-      expect(m.definition).toBe(`CREATE INDEX ${table}_i5 ON ${schema}.${table} (name, start_after) WHERE state < 'active' AND NOT blocked`)
+      expect(m.definition).toBe(`CREATE INDEX ${table}_i5 ON ${schema}.${table} (name, start_after) WHERE (state < 'active') AND (NOT blocked)`)
     })
 
     it('treats a missing index with a pending BAM build as building, not missing', async function () {
@@ -697,17 +705,21 @@ describe('drift', function () {
       expect(report.missing.map(i => i.name)).not.toContain(`${table}_i5`)
     })
 
-    it('flags a stray pg-boss-named index as unexpected', async function () {
+    it('reports stray indexes on a managed table as extra (a warning; ok stays true)', async function () {
       ctx.boss = await helper.start({ ...ctx.bossConfig })
       const schema = ctx.schema
       const table = helper.isCockroachDb ? 'job' : 'job_common'
 
       const db = await helper.getDb()
-      await db.executeSql(`CREATE INDEX ${table}_i99 ON ${schema}.${table} (name)`)
+      await db.executeSql(`CREATE INDEX ${table}_i99 ON ${schema}.${table} (name)`) // stale pg-boss-named
+      await db.executeSql(`CREATE INDEX my_custom_idx ON ${schema}.${table} (priority)`) // user-named
       await db.close()
 
       const report = await ctx.boss.detectSchemaDrift()
-      expect(report.unexpected.map(i => i.name)).toContain(`${table}_i99`)
+      const names = report.extraIndexes.map(i => i.name)
+      expect(names).toContain(`${table}_i99`)
+      expect(names).toContain('my_custom_idx')
+      expect(report.ok).toBe(true) // extra indexes are informational, not drift
     })
 
     it('detects an index whose key columns are reordered as mismatched', async function () {
@@ -730,7 +742,7 @@ describe('drift', function () {
       expect(m.expectedKeys).toBe('name, id')
       expect(m.actualKeys).toBe('id, name')
       // side-by-side full definitions: expected (correct) vs actual (from pg_get_indexdef)
-      expect(m.definition).toBe(`CREATE INDEX ${table}_i9 ON ${schema}.${table} (name, id) WHERE blocking AND state = 'completed'`)
+      expect(m.definition).toBe(`CREATE INDEX ${table}_i9 ON ${schema}.${table} (name, id) WHERE blocking AND (state = 'completed')`)
       expect(m.actualDefinition).toContain('(id, name)')
       expect(m.actualDefinition).not.toContain('USING btree')
     })
@@ -752,7 +764,7 @@ describe('drift', function () {
       expect(m).toBeTruthy()
       expect(m.differs).toEqual(['predicate'])
       // Readable form from pg_get_indexdef (schema-qualified casts vary), so match on the meaningful bits.
-      expect(m.expectedPredicate).toBe("blocking AND state = 'completed'")
+      expect(m.expectedPredicate).toBe("blocking AND (state = 'completed')")
       expect(m.actualPredicate).toContain("state = 'active'")
       expect(m.actualPredicate).not.toContain("'completed'")
     })
