@@ -150,4 +150,71 @@ describe('insert', function () {
     expect(called).toBe(true)
     expect(job!.deadLetter).toBe(input.deadLetter)
   })
+
+  it('should attribute insert spy data to the right id when ON CONFLICT skips a job', async function () {
+    // insertJobs ends in ON CONFLICT DO NOTHING; on a short-policy queue a duplicate singletonKey is
+    // skipped, so the returned rows no longer align positionally with the input jobs. The spy must
+    // map each returned id back to its own job's data — a positional rows[i] <-> jobs[i] pairing
+    // would attribute the skipped job's data to a surviving id.
+    ctx.boss = await helper.start({ ...ctx.bossConfig, noDefault: true, __test__enableSpies: true })
+    await ctx.boss.createQueue(ctx.schema, { policy: 'short' })
+    const spy = ctx.boss.getSpy(ctx.schema)
+
+    const jobs = [
+      { data: { tag: 'A' }, singletonKey: 'k1' },
+      { data: { tag: 'B' }, singletonKey: 'k1' }, // conflicts with A on job_i1, skipped
+      { data: { tag: 'C' }, singletonKey: 'k2' }
+    ]
+
+    const ids = await ctx.boss.insert(ctx.schema, jobs)
+    expect(ids).toHaveLength(2)
+
+    const tags = new Set<string>()
+    for (const id of ids!) {
+      const job = await spy.waitForJobWithId(id, 'created')
+      tags.add((job.data as { tag: string }).tag)
+    }
+
+    // Skipped job B's data must never be attributed to a surviving id.
+    expect(tags).toEqual(new Set(['A', 'C']))
+  })
+
+  it('should track insert spy jobs that supply an explicit id or omit data', async function () {
+    // Exercises both sides of the spy-only id/data normalization: a job carrying its own id keeps
+    // it, a job with no data is tracked as {}.
+    ctx.boss = await helper.start({ ...ctx.bossConfig, noDefault: true, __test__enableSpies: true })
+    await ctx.boss.createQueue(ctx.schema)
+    const spy = ctx.boss.getSpy(ctx.schema)
+
+    const explicitId = randomUUID()
+    const ids = await ctx.boss.insert(ctx.schema, [
+      { id: explicitId, data: { tag: 'X' } },
+      {}
+    ])
+    expect(ids).toHaveLength(2)
+
+    const withId = await spy.waitForJobWithId(explicitId, 'created')
+    expect((withId.data as { tag: string }).tag).toBe('X')
+
+    const otherId = ids!.find(id => id !== explicitId)!
+    const noData = await spy.waitForJobWithId(otherId, 'created')
+    expect(noData.data).toEqual({})
+  })
+
+  it('should throw when the same explicit id appears twice in one insert batch', async function () {
+    // ON CONFLICT DO NOTHING would otherwise silently drop the duplicate; fail fast instead so a
+    // lost job surfaces as an error.
+    ctx.boss = await helper.start({ ...ctx.bossConfig, noDefault: true })
+    await ctx.boss.createQueue(ctx.schema)
+
+    const dupe = randomUUID()
+    await expect(ctx.boss.insert(ctx.schema, [
+      { id: dupe, data: { n: 1 } },
+      { id: dupe, data: { n: 2 } }
+    ])).rejects.toThrow(`duplicate job id in insert batch: ${dupe}`)
+
+    // Jobs without explicit ids never collide.
+    const ids = await ctx.boss.insert(ctx.schema, [{}, {}], { returnId: true })
+    expect(ids).toHaveLength(2)
+  })
 })

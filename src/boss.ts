@@ -186,10 +186,6 @@ class Boss extends EventEmitter implements types.EventsMixin {
       return acc
     }, {})
 
-    const heartbeatQueueNames = new Set(
-      queues.filter(q => q.heartbeatSeconds != null).map(q => q.name)
-    )
-
     for (const queueGroup of Object.values(queueGroups)) {
       if (this.#stopping) return
 
@@ -201,7 +197,7 @@ class Boss extends EventEmitter implements types.EventsMixin {
 
         const chunk = names.splice(0, 100)
 
-        await this.#monitor(table, chunk, heartbeatQueueNames)
+        await this.#monitor(table, chunk)
         await this.#maintain(table, chunk)
       }
     }
@@ -212,7 +208,7 @@ class Boss extends EventEmitter implements types.EventsMixin {
     await this.#maintainQueueStats()
   }
 
-  async #monitor (table: string, names: string[], heartbeatQueueNames: Set<string>) {
+  async #monitor (table: string, names: string[]) {
     if (this.#stopping) return
 
     const command = plans.trySetQueueMonitorTime(
@@ -261,15 +257,11 @@ class Boss extends EventEmitter implements types.EventsMixin {
 
       if (this.#stopping) return
 
-      const heartbeatQueues = queues.filter(q => heartbeatQueueNames.has(q))
-
-      if (heartbeatQueues.length) {
-        if (this.#config.noMultiMutationCte) {
-          await this.#manager.failJobsByHeartbeatDistributed(table, heartbeatQueues)
-        } else {
-          const heartbeatSql = plans.failJobsByHeartbeat(this.#config.schema, table, heartbeatQueues, this.#config.noAdvisoryLocks)
-          await this.#executeQuery(heartbeatSql)
-        }
+      if (this.#config.noMultiMutationCte) {
+        await this.#manager.failJobsByHeartbeatDistributed(table, queues)
+      } else {
+        const heartbeatSql = plans.failJobsByHeartbeat(this.#config.schema, table, queues, this.#config.noAdvisoryLocks)
+        await this.#executeQuery(heartbeatSql)
       }
     }
   }

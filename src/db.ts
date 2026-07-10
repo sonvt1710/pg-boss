@@ -70,6 +70,12 @@ class Db extends EventEmitter implements types.IDatabase, types.EventsMixin {
     let client: pg.Client | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let attempt = 0
+    // Only self-heal once the listener has been established at least once. If the INITIAL connect
+    // fails, the rejection propagates to the caller (Notifier.start), which falls back to
+    // polling-only and discards this subscription's close handle — so a reconnect scheduled from
+    // the client 'error' handler would be an untracked connection nothing can close, keeping the
+    // event loop alive and delivering notifications into a stopped manager.
+    let established = false
 
     const scheduleReconnect = () => {
       if (closed || reconnectTimer) return
@@ -92,7 +98,7 @@ class Db extends EventEmitter implements types.IDatabase, types.EventsMixin {
           next.removeAllListeners()
           next.end().catch(() => {})
           if (client === next) client = null
-          scheduleReconnect()
+          if (established) scheduleReconnect()
         }
       })
 
@@ -118,6 +124,7 @@ class Db extends EventEmitter implements types.IDatabase, types.EventsMixin {
       }
 
       attempt = 0
+      established = true
       onReconnect()
     }
 

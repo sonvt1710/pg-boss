@@ -18,7 +18,8 @@ const COMPATIBILITY_FLAGS = [
   'noDeferrableConstraints',
   'noAdvisoryLocks',
   'noCoveringIndexes',
-  'noListenNotify'
+  'noListenNotify',
+  'noIndexProgressView'
 ] as const
 
 type CompatibilityFlag = typeof COMPATIBILITY_FLAGS[number]
@@ -45,16 +46,27 @@ const BACKEND_PROFILES: Record<types.BackendProfile, BackendDefinition> = {
       noDeferrableConstraints: true,
       noAdvisoryLocks: true,
       noCoveringIndexes: true,
-      noListenNotify: true
+      noListenNotify: true,
+      // Online DDL runs as a schema-change job, not the PG CONCURRENTLY path, and
+      // pg_stat_progress_create_index isn't available — so BAM can't use liveness-based reclaim.
+      noIndexProgressView: true
     }
   },
   yugabytedb: {
     kind: 'distributed',
     flags: {
       noAdvisoryLocks: true,
-      noTablePartitioning: true
+      noTablePartitioning: true,
+      // Index builds are a distributed backfill that pg_stat_progress_create_index doesn't reflect,
+      // so liveness would misread an in-flight build as dead. BAM falls back to the timeout instead.
+      noIndexProgressView: true
     }
   },
+  // No noIndexProgressView: pg-boss keeps its tables coordinator-local (it never calls
+  // create_distributed_table), so CREATE INDEX CONCURRENTLY runs against ordinary local Postgres tables
+  // on the coordinator, where pg_stat_progress_create_index is accurate and liveness-based reclaim is
+  // valid. This holds ONLY while the tables stay coordinator-local — if they are ever distributed, the
+  // coordinator's progress view would misread in-flight worker builds as dead and BAM could double-build.
   citus: { kind: 'distributed', flags: {} },
   pglite: { kind: 'embedded', flags: {} }
 }
@@ -173,12 +185,17 @@ function checkUpdateArgs (args: any, { upsert = false } = {}): types.Request {
   assert(!('priority' in options) || (Number.isInteger(options.priority)), 'priority must be an integer')
 
   if ('startAfter' in options) {
-    options.startAfter = (options.startAfter instanceof Date && typeof options.startAfter.toISOString === 'function')
-      ? options.startAfter.toISOString()
-      : (+options.startAfter > 0)
-          ? '' + options.startAfter
-          : (typeof options.startAfter === 'string')
-              ? options.startAfter
+    // Unlike send(), update() must honor a numeric startAfter of 0 (or negative) — the caller is
+    // explicitly pulling a deferred job forward to now. The send-style `+startAfter > 0` guard
+    // coerced 0 to undefined, which JSON.stringify then dropped, silently making the edit a no-op.
+    // Any finite number is passed through as a seconds interval ('0' -> now()); a string is kept.
+    const startAfter = options.startAfter
+    options.startAfter = (startAfter instanceof Date && typeof startAfter.toISOString === 'function')
+      ? startAfter.toISOString()
+      : (typeof startAfter === 'number' && Number.isFinite(startAfter))
+          ? '' + startAfter
+          : (typeof startAfter === 'string')
+              ? startAfter
               : undefined
   }
 
@@ -486,6 +503,12 @@ function resolveBackend (config: any) {
   // plain Postgres instance, without standing up a backend whose profile sets the flag.
   if (config.__test__noAdvisoryLocks) {
     config.noAdvisoryLocks = true
+  }
+
+  // Test hook: exercise the no-liveness BAM reclaim path (timeout-only, no CONCURRENTLY healing)
+  // used by CockroachDB/YugabyteDB, on a plain Postgres instance.
+  if (config.__test__noIndexProgressView) {
+    config.noIndexProgressView = true
   }
 }
 
