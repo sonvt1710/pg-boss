@@ -234,10 +234,14 @@ async function tryCreateDb (database: string): Promise<void> {
 // PGlite often assigns the same created_on to back-to-back inserts. Tests that assert FIFO /
 // insertion order (ORDER BY created_on, id) need distinct timestamps; without them UUID id order
 // can win and look like a policy bug. No-op on real Postgres, where statement boundaries already
-// advance now(). helper.start() also applies this after each send/insert under PGlite.
+// advance now(). start() wires this into every job-creating method below, so suites rarely need to
+// call it directly - reach for it only when writing jobs through the db handle instead of boss.
 async function separateTimestamps (): Promise<void> {
   if (isPglite) await delay(2)
 }
+
+// Job-creating methods wrapped by start() under PGlite so each write lands on its own created_on.
+const JOB_WRITE_METHODS = ['send', 'sendAfter', 'sendThrottled', 'sendDebounced', 'insert'] as const
 
 async function start (options?: Partial<ConstructorOptions> & { testKey?: string; noDefault?: boolean }): Promise<PgBoss> {
   try {
@@ -253,22 +257,18 @@ async function start (options?: Partial<ConstructorOptions> & { testKey?: string
       await boss.createQueue(config.schema)
     }
 
-    // Under PGlite, back-to-back inserts often share created_on; tests that assert FIFO would
-    // otherwise fall through to UUID id order. Advance the clock after each write so ordering
-    // matches real Postgres without sprinkling delays through every suite.
+    // Advance the clock after each write so insertion ordering matches real Postgres without
+    // sprinkling delays through every suite. See separateTimestamps.
     if (isPglite) {
-      const origSend = boss.send.bind(boss)
-      const origInsert = boss.insert.bind(boss)
-      boss.send = (async (...args: Parameters<PgBoss['send']>) => {
-        const result = await origSend(...args)
-        await separateTimestamps()
-        return result
-      }) as PgBoss['send']
-      boss.insert = (async (...args: Parameters<PgBoss['insert']>) => {
-        const result = await origInsert(...args)
-        await separateTimestamps()
-        return result
-      }) as PgBoss['insert']
+      for (const method of JOB_WRITE_METHODS) {
+        const original = boss[method].bind(boss) as (...args: unknown[]) => Promise<unknown>
+        // @ts-ignore - one wrapper shape for a set of overloaded signatures
+        boss[method] = async (...args: unknown[]) => {
+          const result = await original(...args)
+          await separateTimestamps()
+          return result
+        }
+      }
     }
 
     return boss

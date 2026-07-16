@@ -241,7 +241,7 @@ describe('fetch', function () {
   helper.itPglite('should allow fetching jobs that have a start_after in the future', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
-    await ctx.boss.send(ctx.schema, { startAfter: new Date(Date.now() + 1000) })
+    await ctx.boss.send(ctx.schema, null, { startAfter: new Date(Date.now() + 1000) })
     const db = await helper.getDb()
     const sqlStatements : string[] = []
     const options = {
@@ -258,6 +258,29 @@ describe('fetch', function () {
     const jobs = await ctx.boss.fetch(ctx.schema, { ...options, ignoreStartAfter: true })
     expect(jobs.length).toBe(1)
     expect(sqlStatements.length).toBe(1)
-    expect(!sqlStatements[0].includes('start_after <= now()')).toBeTruthy()
+    expect(sqlStatements[0]).not.toContain('start_after')
+  })
+
+  helper.itPglite('should not fetch jobs that have a start_after in the future by default', async function () {
+    ctx.boss = await helper.start(ctx.bossConfig)
+
+    await ctx.boss.send(ctx.schema, null, { startAfter: new Date(Date.now() + 1000) })
+    const db = await helper.getDb()
+    const sqlStatements : string[] = []
+    const options = {
+      db: {
+        // @ts-ignore
+        async executeSql (sql, values) {
+          sqlStatements.push(sql)
+          // @ts-ignore
+          return db.pool.query(sql, values)
+        }
+      }
+    }
+
+    const jobs = await ctx.boss.fetch(ctx.schema, options)
+    expect(jobs.length).toBe(0)
+    expect(sqlStatements.length).toBe(1)
+    expect(sqlStatements[0]).toContain('start_after <= now()')
   })
 })
