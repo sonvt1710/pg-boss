@@ -1381,7 +1381,12 @@ export function fetchNextJob (options: FetchJobOptions, noSkipLocked = false): S
     `j.name = '${name}'`,
     `j.state < '${JOB_STATES.active}'`,
     'NOT j.blocked',
-    !ignoreStartAfter ? 'j.start_after < now()' : '',
+    // `<=` (not `<`) so a job inserted with the default start_after = now() is immediately
+    // fetchable in the next statement. `now()` is transaction-scoped; on backends with coarse
+    // clock resolution (notably PGlite) consecutive autocommit statements often share the same
+    // timestamp, so `<` would leave freshly-inserted jobs invisible until the clock ticks.
+    // NOTIFY gating already uses `start_after <= now()` for the same reason.
+    !ignoreStartAfter ? 'j.start_after <= now()' : '',
     hasIgnoreSingletons ? `COALESCE(j.singleton_key, '') <> ALL(${params.ignoreSingletonsParam})` : '',
     hasIgnoreGroups ? `(j.group_id IS NULL OR j.group_id <> ALL(${params.ignoreGroupsParam}))` : '',
     hasMinPriority ? `j.priority >= ${params.minPriorityParam}` : '',

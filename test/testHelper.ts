@@ -231,6 +231,14 @@ async function tryCreateDb (database: string): Promise<void> {
   }
 }
 
+// PGlite often assigns the same created_on to back-to-back inserts. Tests that assert FIFO /
+// insertion order (ORDER BY created_on, id) need distinct timestamps; without them UUID id order
+// can win and look like a policy bug. No-op on real Postgres, where statement boundaries already
+// advance now(). helper.start() also applies this after each send/insert under PGlite.
+async function separateTimestamps (): Promise<void> {
+  if (isPglite) await delay(2)
+}
+
 async function start (options?: Partial<ConstructorOptions> & { testKey?: string; noDefault?: boolean }): Promise<PgBoss> {
   try {
     const config = getConfig(options)
@@ -244,6 +252,25 @@ async function start (options?: Partial<ConstructorOptions> & { testKey?: string
       assertTruthy(config.schema)
       await boss.createQueue(config.schema)
     }
+
+    // Under PGlite, back-to-back inserts often share created_on; tests that assert FIFO would
+    // otherwise fall through to UUID id order. Advance the clock after each write so ordering
+    // matches real Postgres without sprinkling delays through every suite.
+    if (isPglite) {
+      const origSend = boss.send.bind(boss)
+      const origInsert = boss.insert.bind(boss)
+      boss.send = (async (...args: Parameters<PgBoss['send']>) => {
+        const result = await origSend(...args)
+        await separateTimestamps()
+        return result
+      }) as PgBoss['send']
+      boss.insert = (async (...args: Parameters<PgBoss['insert']>) => {
+        const result = await origInsert(...args)
+        await separateTimestamps()
+        return result
+      }) as PgBoss['insert']
+    }
+
     return boss
   } catch (err) {
     // this is nice for occaisional debugging, Mr. Linter
@@ -254,11 +281,11 @@ async function start (options?: Partial<ConstructorOptions> & { testKey?: string
   }
 }
 
-// PGlite's now() has coarse, sub-statement resolution, so a row inserted with the default
-// start_after = now() can tie with an immediately following fetch's `start_after < now()` filter and
-// briefly read as not-yet-due. Real Postgres advances now() between statements, so the first attempt
-// always wins there. Retry the fetch a few times so assertions on freshly-inserted jobs (e.g. a job
-// just routed to a dead letter queue) aren't flaky under PGlite.
+// PGlite's now() has coarse, sub-statement resolution, so consecutive statements often share a
+// timestamp. Fetch uses `start_after <= now()` so a row inserted with the default start_after =
+// now() is immediately claimable; prefer that over relying on the clock to tick between send and
+// fetch. fetchWithRetry remains useful for cases where work appears asynchronously (e.g. a job
+// just routed to a dead letter queue) and may not be visible on the first attempt.
 async function fetchWithRetry<T = object> (boss: PgBoss, name: string, options?: FetchOptions, attempts = 20): Promise<Job<T>[]> {
   for (let i = 0; i < attempts; i++) {
     const jobs = await boss.fetch<T>(name, options)
@@ -295,6 +322,7 @@ export {
   dropSchema,
   start,
   fetchWithRetry,
+  separateTimestamps,
   getDb,
   countJobs,
   findJobs,

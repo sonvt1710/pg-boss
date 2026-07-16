@@ -102,7 +102,7 @@ CockroachDB but are independent in principle:
     SELECT id FROM jobs
     WHERE name = $name
       AND state < 'active'
-      AND start_after < now()
+      AND start_after <= now()
     ORDER BY priority DESC, created_on, id
     LIMIT $batchSize
   )
