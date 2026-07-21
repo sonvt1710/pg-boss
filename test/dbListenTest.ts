@@ -32,8 +32,8 @@ helper.describePglite('db listen/notify', function () {
       application_name: 'pgboss_half_open_test',
       host: '127.0.0.1',
       port: proxyPort,
-      __test__listenHeartbeatIntervalMs: 100,
-      __test__listenHeartbeatTimeoutMs: 100
+      notifyHeartbeatIntervalMs: 100,
+      notifyHeartbeatTimeoutMs: 100
     })
     const channel = 'pgboss_db_half_open_test'
     const payloads: string[] = []
@@ -77,8 +77,8 @@ helper.describePglite('db listen/notify', function () {
     const db = new Db({
       ...helper.getConfig(),
       application_name: 'pgboss_lost_subscription_test',
-      __test__listenHeartbeatIntervalMs: 100,
-      __test__listenHeartbeatTimeoutMs: 100
+      notifyHeartbeatIntervalMs: 100,
+      notifyHeartbeatTimeoutMs: 100
     })
     const channel = 'pgboss_db_lost_subscription_test'
     const payloads: string[] = []

@@ -6,9 +6,9 @@ import type * as types from './types.ts'
 // Keep silent network failures below the default 30-second notify polling backstop: in the
 // worst case a failure happens immediately after a successful check, then takes one interval,
 // one query timeout, and the existing first reconnect backoff (1s) to restore LISTEN.
-const LISTEN_HEARTBEAT_INTERVAL_MS = 10000
-const LISTEN_HEARTBEAT_TIMEOUT_MS = 5000
-const LISTEN_KEEP_ALIVE_INITIAL_DELAY_MS = 10000
+const DEFAULT_LISTEN_HEARTBEAT_INTERVAL_MS = 10000
+const DEFAULT_LISTEN_HEARTBEAT_TIMEOUT_MS = 5000
+const DEFAULT_LISTEN_KEEP_ALIVE_INITIAL_DELAY_MS = 10000
 
 class Db extends EventEmitter implements types.IDatabase, types.EventsMixin {
   private pool!: pg.Pool
@@ -79,8 +79,9 @@ class Db extends EventEmitter implements types.IDatabase, types.EventsMixin {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
     let attempt = 0
-    const heartbeatInterval = this.config.__test__listenHeartbeatIntervalMs ?? LISTEN_HEARTBEAT_INTERVAL_MS
-    const heartbeatTimeout = this.config.__test__listenHeartbeatTimeoutMs ?? LISTEN_HEARTBEAT_TIMEOUT_MS
+    const heartbeatInterval = this.config.notifyHeartbeatIntervalMs ?? DEFAULT_LISTEN_HEARTBEAT_INTERVAL_MS
+    const heartbeatTimeout = this.config.notifyHeartbeatTimeoutMs ?? DEFAULT_LISTEN_HEARTBEAT_TIMEOUT_MS
+    const keepAliveInitialDelay = this.config.notifyKeepAliveInitialDelayMs ?? DEFAULT_LISTEN_KEEP_ALIVE_INITIAL_DELAY_MS
     // Only self-heal once the listener has been established at least once. If the INITIAL connect
     // fails, the rejection propagates to the caller (Notifier.start), which falls back to
     // polling-only and discards this subscription's close handle — so a reconnect scheduled from
@@ -161,7 +162,7 @@ class Db extends EventEmitter implements types.IDatabase, types.EventsMixin {
       const next = new pg.Client({
         ...this.config,
         keepAlive: true,
-        keepAliveInitialDelayMillis: LISTEN_KEEP_ALIVE_INITIAL_DELAY_MS
+        keepAliveInitialDelayMillis: keepAliveInitialDelay
       })
 
       next.on('error', error => {

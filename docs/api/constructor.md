@@ -40,6 +40,18 @@ The following options can be set as properties in an object for additional confi
 
   Number of milliseconds to wait before timing out when acquiring a new client from the pool. Set to `0` to disable the timeout and wait indefinitely.
 
+* **notifyHeartbeatIntervalMs** - int, defaults to 10000
+
+  Interval between heartbeat checks on the dedicated LISTEN/NOTIFY connection. Lower values detect silent connection drops faster at the cost of more heartbeat queries.
+
+* **notifyHeartbeatTimeoutMs** - int, defaults to 5000
+
+  Timeout for each LISTEN/NOTIFY heartbeat query. If a heartbeat does not complete within this window the listener is torn down and reconnected. Raise this on a loaded database where the default is too aggressive.
+
+* **notifyKeepAliveInitialDelayMs** - int, defaults to 10000
+
+  TCP keepalive initial delay for the dedicated LISTEN/NOTIFY connection.
+
 * **db** - object
 
     Passing an object named db allows you "bring your own database connection". This option may be beneficial if you'd like to use an existing database service with its own connection pool. Setting this option will bypass the above configuration.

@@ -45,12 +45,25 @@ export interface DatabaseOptions {
   max?: number;
   db?: IDatabase;
   connectionTimeoutMillis?: number;
+  /**
+   * Interval in milliseconds between LISTEN/NOTIFY heartbeat checks on the dedicated
+   * listener connection. Lower values detect silent connection drops faster at the cost
+   * of more heartbeat queries. Defaults to 10000.
+   */
+  notifyHeartbeatIntervalMs?: number;
+  /**
+   * Timeout in milliseconds for each LISTEN/NOTIFY heartbeat query. If a heartbeat does
+   * not complete within this window the listener is torn down and reconnected. Raise this
+   * on a loaded database where the default is too aggressive. Defaults to 5000.
+   */
+  notifyHeartbeatTimeoutMs?: number;
+  /**
+   * TCP keepalive initial delay in milliseconds for the dedicated LISTEN/NOTIFY connection.
+   * Defaults to 10000.
+   */
+  notifyKeepAliveInitialDelayMs?: number;
   /** @internal */
   debug?: boolean;
-  /** @internal */
-  __test__listenHeartbeatIntervalMs?: number;
-  /** @internal */
-  __test__listenHeartbeatTimeoutMs?: number;
 }
 
 export interface SchedulingOptions {
