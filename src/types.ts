@@ -47,6 +47,10 @@ export interface DatabaseOptions {
   connectionTimeoutMillis?: number;
   /** @internal */
   debug?: boolean;
+  /** @internal */
+  __test__listenHeartbeatIntervalMs?: number;
+  /** @internal */
+  __test__listenHeartbeatTimeoutMs?: number;
 }
 
 export interface SchedulingOptions {
