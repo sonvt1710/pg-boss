@@ -3,10 +3,16 @@ import { setTimeout } from 'node:timers/promises'
 /**
  * When sql contains multiple queries, result is an array of objects with rows property
  * This function unwraps the result into a single object with rows property
+ *
+ * Some drivers (postgres.js, and therefore drizzle-orm/postgres-js) instead return the rows
+ * themselves as a flat array. Those elements have no `rows` property, so treat the array
+ * as the row set rather than flat-mapping undefined into it.
 */
-function unwrapSQLResult (result: { rows: any[] } | { rows: any[] }[]): { rows: any[] } {
+function unwrapSQLResult (result: { rows: any[] } | { rows: any[] }[] | any[]): { rows: any[] } {
   if (Array.isArray(result)) {
-    return { rows: result.flatMap(i => i.rows) }
+    return result.every(i => Array.isArray(i?.rows))
+      ? { rows: result.flatMap(i => i.rows) }
+      : { rows: result }
   }
 
   return result
